@@ -1,0 +1,31 @@
+[
+  {
+    "sample_id": "sample-0001",
+    "acquisition_method": "scan",
+    "quality": "high",
+    "language": "it",
+    "labels": {
+      "slant": "right",
+      "pressure": "medium",
+      "spacing": "regular"
+    }
+  },
+  {
+    "sample_id": "sample-0002",
+    "acquisition_method": "photo",
+    "quality": "medium",
+    "language": "en",
+    "labels": {
+      "slant": "vertical",
+      "pressure": "light",
+      "baseline": "ascending"
+    }
+  },
+  {
+    "sample_id": "sample-0003",
+    "acquisition_method": "photo",
+    "quality": "low",
+    "language": null,
+    "labels": {}
+  }
+]
