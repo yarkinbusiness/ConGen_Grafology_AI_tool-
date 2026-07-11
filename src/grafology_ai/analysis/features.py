@@ -140,6 +140,39 @@ _CONF_FULL_AT_LINE_GAPS = 3
 _CONF_FULL_AT_WORD_GAPS = 5
 _CONF_FULL_AT_BASELINE_COLUMNS = 100
 
+# --- Rhythm regularity -------------------------------------------------------
+
+#: Minimum number of observations (per-band heights, per-band widths, or
+#: word gaps) a single ingredient of the :func:`_build_rhythm_regularity`
+#: composite needs before its coefficient-of-variation score is considered
+#: meaningful at all -- a "spread" computed from 0 or 1 points isn't a
+#: regularity measurement, it's noise. Ingredients with fewer observations
+#: than this are dropped from the composite (see the weight-renormalization
+#: in :func:`_build_rhythm_regularity`) rather than forced to a fabricated
+#: score.
+_RHYTHM_MIN_OBSERVATIONS = 2
+
+#: Equal weights for the three rhythm ingredients -- per-line-band ink-run
+#: (letter) height, word-gap length, and per-line-band stroke width. The
+#: labeling rubric's Rhythm definition ("how evenly stroke shapes, sizes,
+#: and spacing repeat") does not prioritize any one of these over the
+#: others, so they are weighted equally by default; when an ingredient is
+#: unusable (see :data:`_RHYTHM_MIN_OBSERVATIONS`) the remaining weights are
+#: renormalized rather than treating the missing ingredient as "perfectly
+#: regular".
+_RHYTHM_WEIGHT_LINE_HEIGHT = 1.0 / 3.0
+_RHYTHM_WEIGHT_WORD_GAP = 1.0 / 3.0
+_RHYTHM_WEIGHT_STROKE_WIDTH = 1.0 / 3.0
+
+#: "Full confidence" sample-size threshold for the per-line-band ingredients
+#: of rhythm_regularity (letter height, stroke width): confidence ramps up
+#: as the number of line bands that contributed a usable value approaches
+#: this many, matching the spirit of :data:`_CONF_FULL_AT_LINE_GAPS` (a
+#: regularity read off very few bands is not well supported). The word-gap
+#: ingredient reuses :data:`_CONF_FULL_AT_WORD_GAPS` since it is built from
+#: the exact same gap list as ``word_spacing_mean``.
+_CONF_FULL_AT_RHYTHM_BANDS = 3
+
 
 @dataclass(frozen=True)
 class Features:
@@ -185,6 +218,13 @@ class Features:
             content bounding box, in [0, 1] -- a rough proxy for rhythm
             and continuity of stroke (see ``docs/labeling_rubric.md``'s
             "Rhythm" / "Stroke Continuity" indicators).
+        rhythm_regularity: Regularity of repetition across the sample, in
+            [0, 1] where 1.0 means highly regular/rhythmic, per
+            ``docs/labeling_rubric.md``'s "Rhythm" indicator ("how evenly
+            stroke shapes, sizes, and spacing repeat"). An
+            inverse-coefficient-of-variation composite over per-line-band
+            ink-run (letter) heights, word-gap lengths, and per-line-band
+            stroke widths -- see :func:`_build_rhythm_regularity`.
         confidence: Maps each of the above field names to a 0-1
             confidence score. See :func:`_build_confidence` for the
             heuristic (in short: measurements built from very few
@@ -204,6 +244,7 @@ class Features:
     margin_top_px: float
     margin_bottom_px: float
     ink_density: float
+    rhythm_regularity: float
     confidence: dict[str, float]
 
 
@@ -571,10 +612,8 @@ def _estimate_baseline_slope(
 # --- word spacing ------------------------------------------------------------
 
 
-def _estimate_word_spacing(
-    mask: np.ndarray, bands: list[tuple[int, int]]
-) -> tuple[float, int]:
-    """Estimate average horizontal word-gap (pixels) within detected lines.
+def _word_gaps(mask: np.ndarray, bands: list[tuple[int, int]]) -> list[float]:
+    """Return the individual "word"-scale horizontal gap lengths (pixels).
 
     Within each line band, projects ink onto columns (does this column
     contain any ink within the band?) and measures the horizontal gaps
@@ -582,11 +621,17 @@ def _estimate_word_spacing(
     clusters. Handwriting has two gap scales (tight intra-word/
     letter-to-letter gaps, and wider inter-word gaps); once enough gaps
     are collected, :func:`_otsu_threshold` splits them into these two
-    clusters and only the larger ("word") cluster is averaged. With too
-    few gaps to split meaningfully, all detected gaps are averaged as a
+    clusters and only the larger ("word") cluster is returned. With too
+    few gaps to split meaningfully, all detected gaps are returned as a
     fallback.
 
-    Returns ``(0.0, 0)`` if no gaps were found at all.
+    Extracted as its own function (rather than inlined in
+    :func:`_estimate_word_spacing`) so callers that need the raw list of
+    gap lengths -- not just their mean -- can reuse it without
+    re-deriving it; see :func:`_build_rhythm_regularity`, which needs the
+    spread of word-gap lengths, not merely their average.
+
+    Returns an empty list if no gaps were found at all.
     """
     all_gaps: list[int] = []
     for start, end in bands:
@@ -601,17 +646,142 @@ def _estimate_word_spacing(
         all_gaps.extend(int(g) for g in gaps if g > 0)
 
     if not all_gaps:
-        return 0.0, 0
+        return []
 
     gaps_array = np.array(all_gaps, dtype=np.float64)
     if gaps_array.size < _MIN_GAPS_FOR_OTSU_SPLIT:
-        return float(gaps_array.mean()), int(gaps_array.size)
+        return [float(g) for g in gaps_array]
 
     threshold = _otsu_threshold(gaps_array)
     word_gaps = gaps_array[gaps_array > threshold]
     if word_gaps.size == 0:
         word_gaps = gaps_array
-    return float(word_gaps.mean()), int(word_gaps.size)
+    return [float(g) for g in word_gaps]
+
+
+def _estimate_word_spacing(
+    mask: np.ndarray, bands: list[tuple[int, int]]
+) -> tuple[float, int]:
+    """Estimate average horizontal word-gap (pixels) within detected lines.
+
+    Thin wrapper around :func:`_word_gaps`: averages the word-scale gap
+    list it returns. Returns ``(0.0, 0)`` if no gaps were found at all.
+    """
+    gaps = _word_gaps(mask, bands)
+    if not gaps:
+        return 0.0, 0
+    return float(np.mean(gaps)), len(gaps)
+
+
+# --- rhythm regularity --------------------------------------------------------
+
+
+def _per_band_run_stats(
+    mask: np.ndarray, bands: list[tuple[int, int]], slant_correction: float
+) -> tuple[list[float], list[float]]:
+    """Per-line-band mean ink-run height and stroke width, one entry per band.
+
+    Reuses the same run-length machinery as the whole-image
+    ``letter_size_estimate``/``stroke_width_mean`` measurements
+    (:func:`_run_lengths_rowwise`, :func:`_robust_run_stats`), but scoped
+    to one line band at a time: column-wise (vertical) runs within a band
+    approximate that band's letter/ink-run height, row-wise (horizontal)
+    runs approximate that band's stroke width. This is what lets
+    :func:`_build_rhythm_regularity` measure regularity *across* bands
+    (does letter size/stroke width stay consistent line to line?) rather
+    than only ever seeing one whole-sample average.
+
+    A band that yields no measurable runs is simply skipped (not padded
+    with a 0.0) -- an unmeasured band should not be scored as
+    "irregular".
+
+    Returns ``(heights, widths)``, each a plain list of per-band means
+    (possibly of different lengths, since a band could yield a usable
+    horizontal-run measurement but not a vertical one, or vice versa).
+    """
+    heights: list[float] = []
+    widths: list[float] = []
+    for start, end in bands:
+        band = mask[start:end, :]
+        if band.shape[0] == 0:
+            continue
+
+        row_runs = _run_lengths_rowwise(band)
+        row_runs = row_runs[row_runs > 0]
+        width_mean, _width_std, width_n = _robust_run_stats(row_runs, slant_correction)
+        if width_n > 0:
+            widths.append(width_mean)
+
+        col_runs = _run_lengths_rowwise(band.T)
+        col_runs = col_runs[col_runs > 0]
+        height_mean, _height_std, height_n = _robust_run_stats(col_runs, slant_correction)
+        if height_n > 0:
+            heights.append(height_mean)
+
+    return heights, widths
+
+
+def _inverse_cv_score(values: list[float]) -> float:
+    """Inverse-coefficient-of-variation regularity score for one measurement list.
+
+    Computes ``1 / (1 + CV)`` where ``CV = std / mean`` is the coefficient
+    of variation of ``values``: 1.0 when every value is identical (zero
+    spread, perfectly regular), approaching 0.0 as the spread grows large
+    relative to the mean (increasingly irregular). Using ``CV`` (a
+    *relative* spread measure) rather than raw standard deviation matters
+    because the three rhythm ingredients live on different scales (pixel
+    heights, pixel gaps, pixel widths) -- CV makes them comparable before
+    they're combined into one composite.
+
+    Returns 0.0 if there are fewer than :data:`_RHYTHM_MIN_OBSERVATIONS`
+    values, or if the mean is not positive (no meaningful spread to
+    measure in either case).
+    """
+    if len(values) < _RHYTHM_MIN_OBSERVATIONS:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    mean = float(arr.mean())
+    if mean <= 0:
+        return 0.0
+    cv = float(arr.std()) / mean
+    return float(1.0 / (1.0 + cv))
+
+
+def _build_rhythm_regularity(
+    height_values: list[float], word_gap_values: list[float], width_values: list[float]
+) -> float:
+    """Composite rhythm_regularity score in [0, 1] (1.0 = highly regular).
+
+    A weighted average of three :func:`_inverse_cv_score` sub-scores --
+    per-line-band ink-run (letter) height, word-gap length, and
+    per-line-band stroke width -- per ``docs/labeling_rubric.md``'s
+    Rhythm definition ("how evenly stroke shapes, sizes, and spacing
+    repeat across the sample"). Weights are :data:`_RHYTHM_WEIGHT_LINE_HEIGHT`,
+    :data:`_RHYTHM_WEIGHT_WORD_GAP`, :data:`_RHYTHM_WEIGHT_STROKE_WIDTH`.
+
+    An ingredient with too few observations to score
+    (:data:`_RHYTHM_MIN_OBSERVATIONS`, checked via ``_inverse_cv_score``
+    returning 0.0 in that case) is dropped entirely and the remaining
+    weights are renormalized, rather than letting a missing ingredient
+    silently count as "perfectly regular" (a 0.0 default would instead
+    wrongly count as "perfectly irregular", also wrong). If no ingredient
+    has enough observations at all, returns 0.0.
+    """
+    ingredients = (
+        (height_values, _RHYTHM_WEIGHT_LINE_HEIGHT),
+        (word_gap_values, _RHYTHM_WEIGHT_WORD_GAP),
+        (width_values, _RHYTHM_WEIGHT_STROKE_WIDTH),
+    )
+    usable = [
+        (_inverse_cv_score(values), weight)
+        for values, weight in ingredients
+        if len(values) >= _RHYTHM_MIN_OBSERVATIONS
+    ]
+    total_weight = sum(weight for _score, weight in usable)
+    if total_weight <= 0:
+        return 0.0
+    weighted_sum = sum(score * weight for score, weight in usable)
+    return float(min(1.0, max(0.0, weighted_sum / total_weight)))
 
 
 # --- confidence ---------------------------------------------------------------
@@ -632,6 +802,8 @@ def _build_confidence(
     line_gap_n: int,
     word_gap_n: int,
     baseline_n: int,
+    rhythm_height_band_n: int,
+    rhythm_width_band_n: int,
     has_ink: bool,
 ) -> dict[str, float]:
     """Build the per-field confidence heuristic described on :class:`Features`.
@@ -648,8 +820,24 @@ def _build_confidence(
       near-exact once *any* ink is found (they're a bounding box and a
       pixel-count ratio, not a statistical estimate), so they get a flat
       high/low split on whether any ink exists at all.
+
+    ``rhythm_regularity`` is a third, composite case: it is the unweighted
+    mean of three per-ingredient confidences (line-band letter height,
+    word-gap length reusing ``word_gap_n``, line-band stroke width),
+    deliberately *not* renormalized over only the usable ingredients the
+    way :func:`_build_rhythm_regularity`'s value itself is. That
+    asymmetry is intentional: a rhythm score built from only one usable
+    ingredient (e.g. plenty of word gaps but too few detected line bands)
+    should read as *less* trustworthy than one built from all three, even
+    though the value's own renormalization means it doesn't look
+    "wrong" -- confidence is where that missing evidence should show up.
     """
     geometric_confidence = 1.0 if has_ink else 0.0
+    rhythm_confidence = (
+        _confidence_scale(rhythm_height_band_n, _CONF_FULL_AT_RHYTHM_BANDS)
+        + _confidence_scale(word_gap_n, _CONF_FULL_AT_WORD_GAPS)
+        + _confidence_scale(rhythm_width_band_n, _CONF_FULL_AT_RHYTHM_BANDS)
+    ) / 3.0
     confidence = {
         "slant_angle_degrees": _confidence_scale(slant_n, _CONF_FULL_AT_SLANT_PIXELS),
         "stroke_width_mean": _confidence_scale(width_n, _CONF_FULL_AT_RUNS),
@@ -663,6 +851,7 @@ def _build_confidence(
         "margin_top_px": geometric_confidence,
         "margin_bottom_px": geometric_confidence,
         "ink_density": geometric_confidence,
+        "rhythm_regularity": rhythm_confidence,
     }
     # Belt-and-suspenders clamp: every value must land in [0, 1].
     return {key: min(1.0, max(0.0, value)) for key, value in confidence.items()}
@@ -694,6 +883,7 @@ def _empty_features(width: int, height: int) -> Features:
         margin_top_px=0.0,
         margin_bottom_px=0.0,
         ink_density=0.0,
+        rhythm_regularity=0.0,
         confidence=zero_confidence,
     )
 
@@ -763,7 +953,18 @@ def analyze(image: ImageInput) -> Features:
 
     line_spacing_mean, line_gap_n = _mean_band_gap(bands)
     baseline_slope_degrees, baseline_n = _estimate_baseline_slope(ink_mask, bands)
+
     word_spacing_mean, word_gap_n = _estimate_word_spacing(ink_mask, bands)
+
+    # The raw word-gap list (not just its mean) is also one of the three
+    # rhythm_regularity ingredients below -- its *spread* matters there.
+    word_gaps = _word_gaps(ink_mask, bands)
+
+    # Rhythm regularity: per-line-band letter height / stroke width plus the
+    # word-gap list collected above, combined via an inverse-CV composite
+    # (see _build_rhythm_regularity).
+    rhythm_heights, rhythm_widths = _per_band_run_stats(ink_mask, bands, slant_correction)
+    rhythm_regularity = _build_rhythm_regularity(rhythm_heights, word_gaps, rhythm_widths)
 
     confidence = _build_confidence(
         slant_n=slant_n,
@@ -772,6 +973,8 @@ def analyze(image: ImageInput) -> Features:
         line_gap_n=line_gap_n,
         word_gap_n=word_gap_n,
         baseline_n=baseline_n,
+        rhythm_height_band_n=len(rhythm_heights),
+        rhythm_width_band_n=len(rhythm_widths),
         has_ink=True,
     )
 
@@ -788,5 +991,6 @@ def analyze(image: ImageInput) -> Features:
         margin_top_px=margin_top,
         margin_bottom_px=margin_bottom,
         ink_density=ink_density,
+        rhythm_regularity=rhythm_regularity,
         confidence=confidence,
     )

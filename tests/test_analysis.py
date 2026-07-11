@@ -29,10 +29,12 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
 from grafology_ai.analysis import FEATURE_CONFIDENCE_KEYS, Features, analyze
+from grafology_ai.dataset.fixtures import generate_fixture_dataset
 
 BACKGROUND = 255
 INK = 0
@@ -134,6 +136,45 @@ def _draw_pushed_content(
 
 def _blank_image(size: tuple[int, int] = (300, 300)) -> Image.Image:
     return Image.new("RGB", size, color=(255, 255, 255))
+
+
+def _draw_rhythm_grid(
+    size: tuple[int, int],
+    *,
+    line_specs: list[tuple[int, int, int]],
+    words_per_line: int = 6,
+    letters_per_word: int = 4,
+    letter_gap: int = 6,
+    line_pitch: int = 50,
+    margin: int = 30,
+) -> Image.Image:
+    """A grid of "words" with independently controllable per-line rhythm ingredients.
+
+    ``line_specs`` is one ``(stroke_width, stroke_height, word_gap)`` triple
+    per drawn line -- i.e. direct, known-ground-truth control over the
+    three quantities the ``rhythm_regularity`` composite measures
+    (per-line stroke width, per-line letter/ink-run height, and the
+    word-gap length used between every word on that line). Every line
+    draws exactly ``words_per_line * letters_per_word`` strokes regardless
+    of ``line_specs`` (word/letter *counts* are fixed, only their
+    thickness/height/spacing vary), so passing triples whose
+    ``stroke_width * stroke_height`` product is held constant across all
+    lines keeps total ink pixel area matched across differently-*shaped*
+    images -- letting a test isolate regularity (the spread of these
+    quantities across lines) from density (how much ink there is overall).
+    """
+    image = Image.new("L", size, color=BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    for i, (stroke_width, stroke_height, word_gap) in enumerate(line_specs):
+        y = margin + i * line_pitch + stroke_height
+        x = margin
+        for _word in range(words_per_line):
+            for _letter in range(letters_per_word):
+                draw.line([(x, y), (x, y - stroke_height)], fill=INK, width=stroke_width)
+                x += letter_gap
+            x += word_gap
+    return image.convert("RGB")
 
 
 # --- slant --------------------------------------------------------------
@@ -325,3 +366,85 @@ def test_letter_size_estimate_positive_for_normal_image_and_zero_for_blank() -> 
 
     assert normal_features.letter_size_estimate > 0
     assert blank_features.letter_size_estimate == 0.0
+
+
+# --- rhythm regularity ---------------------------------------------------
+
+
+def test_rhythm_regularity_field_and_confidence_key_exist() -> None:
+    assert "rhythm_regularity" in Features.__dataclass_fields__
+    assert "rhythm_regularity" in FEATURE_CONFIDENCE_KEYS
+
+    features = analyze(_draw_stroke_grid((400, 300)))
+    assert "rhythm_regularity" in features.confidence
+
+
+def test_uniform_rhythm_scores_higher_than_varied_with_matched_ink_amount() -> None:
+    # Every line uses the same (stroke_width, stroke_height, word_gap)
+    # triple: zero spread in any of the three rhythm ingredients.
+    uniform_specs = [(6, 16, 30)] * 6
+
+    # Alternating lines use two different triples whose stroke_width *
+    # stroke_height product is held at 96 (matching the uniform triple's
+    # 6 * 16 = 96), so every line draws the same total ink area -- only
+    # the *shape* (thin-and-tall vs thick-and-short letters) and the
+    # word-gap length vary from line to line. This isolates rhythm
+    # (regularity) from ink density (amount).
+    varied_specs = [(4, 24, 15) if i % 2 == 0 else (8, 12, 45) for i in range(6)]
+
+    uniform_image = _draw_rhythm_grid((700, 500), line_specs=uniform_specs)
+    varied_image = _draw_rhythm_grid((700, 500), line_specs=varied_specs)
+
+    # Confirm the "matched ink amount" premise: total ink pixel counts
+    # should be close (not necessarily identical, since discrete pixel
+    # rounding and rendering of different stroke shapes isn't perfectly
+    # exact), well within a loose tolerance.
+    uniform_ink = (np.asarray(uniform_image.convert("L")) != BACKGROUND).sum()
+    varied_ink = (np.asarray(varied_image.convert("L")) != BACKGROUND).sum()
+    assert varied_ink == pytest.approx(uniform_ink, rel=0.1)
+
+    uniform_features = analyze(uniform_image)
+    varied_features = analyze(varied_image)
+
+    assert uniform_features.rhythm_regularity > varied_features.rhythm_regularity
+
+
+def test_rhythm_regularity_within_unit_interval_and_finite_across_fixture_dataset(
+    tmp_path: Path,
+) -> None:
+    entries = generate_fixture_dataset(tmp_path / "raw", count=12, seed=1)
+    images_dir = tmp_path / "raw" / "images"
+
+    for entry in entries:
+        features = analyze(images_dir / f"{entry.sample_id}.png")
+        assert math.isfinite(features.rhythm_regularity)
+        assert 0.0 <= features.rhythm_regularity <= 1.0
+        assert math.isfinite(features.confidence["rhythm_regularity"])
+        assert 0.0 <= features.confidence["rhythm_regularity"] <= 1.0
+
+
+def test_analyze_blank_image_rhythm_regularity_and_confidence_are_zero() -> None:
+    features = analyze(_blank_image())
+    assert features.rhythm_regularity == 0.0
+    assert features.confidence["rhythm_regularity"] == 0.0
+
+
+def test_rhythm_regularity_is_deterministic_across_repeated_analyze_calls() -> None:
+    image = _draw_rhythm_grid((700, 500), line_specs=[(6, 16, 30)] * 6)
+
+    first = analyze(image)
+    second = analyze(image)
+
+    assert first.rhythm_regularity == second.rhythm_regularity
+    assert first.confidence["rhythm_regularity"] == second.confidence["rhythm_regularity"]
+
+
+def test_rhythm_regularity_confidence_within_unit_interval() -> None:
+    rich_image = _draw_rhythm_grid((700, 500), line_specs=[(6, 16, 30)] * 6)
+    sparse_image = Image.new("L", (200, 200), color=BACKGROUND)
+    draw = ImageDraw.Draw(sparse_image)
+    draw.line([(100, 100), (102, 90)], fill=INK, width=1)
+
+    for image in (rich_image, sparse_image.convert("RGB"), _blank_image()):
+        features = analyze(image)
+        assert 0.0 <= features.confidence["rhythm_regularity"] <= 1.0
