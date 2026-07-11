@@ -1,0 +1,792 @@
+"""Classical image-processing feature extraction for handwriting samples.
+
+No trainable model exists yet (there is no real, labeled client dataset to
+train one on -- see :mod:`grafology_ai.dataset.fixtures`). This module is a
+heuristic stand-in: it measures observable, numeric properties directly
+from pixels using classical image processing (Pillow + numpy only, no
+OpenCV/scipy), producing a :class:`Features` record per sample. It later
+either feeds a real trained model as input features, or serves as a
+baseline the trained model is evaluated against.
+
+This module deliberately stops at *measurement*. It reports numbers (a
+slant angle, a stroke-width statistic, a margin in pixels) without
+attaching graphological interpretation or judgment language to them --
+turning measurements into indicator labels/interpretations is a separate,
+later concern (see ``docs/labeling_rubric.md`` for the indicator
+vocabulary this module's measurements are meant to eventually support).
+
+Pipeline overview (see :func:`analyze`):
+
+1. Binarize the image into an ink/background mask with a from-scratch
+   Otsu threshold (:func:`_otsu_threshold`).
+2. Detect approximate text "lines" from the row-wise ink-density profile
+   (:func:`_detect_line_bands`), which drives line spacing and baseline
+   slope.
+3. Detect approximate "strokes" via run-length analysis of the binarized
+   mask -- horizontal runs (row-wise) approximate local stroke thickness,
+   vertical runs (column-wise) approximate stroke/letter height -- rather
+   than full 2D connected-component labeling, which would require either
+   an added dependency or an expensive from-scratch flood fill. This is a
+   deliberate simplification; see :func:`_run_lengths_rowwise`.
+4. Estimate slant via a projection-profile shear search
+   (:func:`_estimate_slant_degrees`): the candidate shear angle whose
+   correction makes ink pixels stack into the sharpest column histogram is
+   taken as the dominant stroke angle.
+5. Compute margins and ink density directly from the ink bounding box.
+
+Every measurement is approximate by construction -- this is a heuristic
+baseline, not a diagnostic tool -- and the confidence heuristic in
+:func:`_build_confidence` is documented at its definition.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import dataclass
+from typing import Union
+
+import numpy as np
+from PIL import Image
+
+ImageInput = Union[Image.Image, str, "os.PathLike[str]"]
+
+# --- Otsu / binarization -------------------------------------------------
+
+#: Number of histogram bins used by the from-scratch Otsu threshold search.
+#: 256 matches the natural resolution of 8-bit grayscale pixel values; for
+#: non-pixel-value inputs (e.g. gap lengths in pixels, see
+#: :func:`_estimate_word_spacing`) this still gives ample resolution for
+#: typical handwriting-sample dimensions.
+_OTSU_HISTOGRAM_BINS = 256
+
+# --- Slant estimation ------------------------------------------------------
+
+#: Below this many ink pixels, a projection-profile slant estimate is
+#: considered unreliable (too few strokes to establish a dominant angle),
+#: and :func:`_estimate_slant_degrees` short-circuits to 0.0 degrees.
+_MIN_INK_PIXELS_FOR_SLANT = 30
+
+#: Candidate shear angles (degrees from vertical) searched when estimating
+#: slant. +/-60 degrees comfortably brackets any handwriting slant that
+#: could plausibly be called "handwriting" rather than sideways text; 1
+#: degree steps give ample resolution given the generous tolerance this
+#: measurement is documented to have.
+_SLANT_CANDIDATE_DEGREES: np.ndarray = np.arange(-60.0, 60.0 + 1e-9, 1.0)
+
+#: Fixed histogram bin width (pixels) used when scoring each candidate
+#: shear angle. A *fixed* width (rather than a fixed bin *count* over a
+#: range that itself grows with the shear) is important: it keeps the
+#: peakiness score comparable across candidate angles instead of biasing
+#: the search toward extreme angles whose wider sheared-x range would
+#: otherwise be binned more coarsely.
+_SLANT_BIN_WIDTH_PX = 2.0
+
+#: Ink pixels are randomly subsampled to at most this many points before
+#: the slant search, since the search cost is O(n_candidates * n_pixels)
+#: and dense samples can have far more ink pixels than are needed to
+#: estimate one dominant angle. The subsample is drawn from a
+#: fixed-seed Generator so :func:`analyze` stays deterministic.
+_MAX_INK_PIXELS_FOR_SLANT_SAMPLE = 20_000
+_SLANT_SAMPLE_SEED = 0
+
+# --- Run-length statistics (stroke width / letter size) --------------------
+
+#: Run lengths (in pixels) are trimmed to this percentile range before
+#: computing mean/std, once enough runs exist (see
+#: _MIN_RUNS_FOR_PERCENTILE_TRIM), to reduce the influence of a handful of
+#: outlier runs (e.g. two strokes that happen to touch on one row).
+_RUN_PERCENTILE_TRIM = (5.0, 95.0)
+_MIN_RUNS_FOR_PERCENTILE_TRIM = 20
+
+# --- Line-band detection (line spacing / baseline slope) -------------------
+
+#: Minimum smoothing window (rows) applied to the row ink-density profile
+#: before thresholding it into line bands, so that small intra-word gaps
+#: (a lifted pen between letters) don't fragment one visual line into
+#: several detected bands. Scales with image height (see
+#: :func:`_detect_line_bands`) but never drops below this floor.
+_LINE_SMOOTH_MIN_WINDOW = 3
+
+#: A row is considered part of a text line once its smoothed ink count
+#: exceeds this fraction of the profile's peak smoothed value.
+_LINE_BAND_THRESHOLD_FRACTION = 0.15
+
+#: Minimum number of ink-containing columns within a line band required
+#: before attempting a baseline-slope line fit for that band; fitting a
+#: line through fewer points is not meaningful.
+_MIN_COLUMNS_FOR_BASELINE_FIT = 5
+
+# --- Word-spacing detection -------------------------------------------------
+
+#: Minimum number of horizontal column-gaps (within line bands) required
+#: before attempting to Otsu-split them into "letter" vs "word" gaps; with
+#: fewer gaps than this, the split is not meaningful and all detected gaps
+#: are simply averaged instead (see :func:`_estimate_word_spacing`).
+_MIN_GAPS_FOR_OTSU_SPLIT = 4
+
+# --- Confidence scaling ------------------------------------------------------
+
+#: "Full confidence" sample-size thresholds used by :func:`_confidence_scale`
+#: for each statistically-estimated indicator: confidence ramps linearly
+#: from 0 up to 1.0 as the number of underlying observations (ink pixels,
+#: runs, gaps, line bands, baseline-fit columns) approaches the threshold,
+#: reflecting that a measurement built from very few observations is less
+#: reliable than one built from many. These are practical, not derived
+#: from any formal statistical procedure.
+_CONF_FULL_AT_SLANT_PIXELS = 1000
+_CONF_FULL_AT_RUNS = 50
+_CONF_FULL_AT_LINE_GAPS = 3
+_CONF_FULL_AT_WORD_GAPS = 5
+_CONF_FULL_AT_BASELINE_COLUMNS = 100
+
+
+@dataclass(frozen=True)
+class Features:
+    """Measurable graphological indicators extracted from a handwriting image.
+
+    Every field is a plain, directly-measured numeric quantity -- no
+    interpretation or judgment language attached (see the module
+    docstring). Turning these into graphological indicator labels (e.g.
+    "right slant", "heavy pressure") is deliberately out of scope here.
+
+    Attributes:
+        slant_angle_degrees: Average angle of stroke segments relative to
+            vertical. Positive means a rightward lean (top of strokes
+            shifted right relative to their base), negative means a
+            leftward lean, matching the sign convention used by
+            :mod:`grafology_ai.dataset.fixtures`.
+        stroke_width_mean: Mean ink-stroke thickness in pixels, a
+            pressure proxy (thicker strokes are read from the image as
+            heavier pen pressure; true pressure cannot be recovered from a
+            static image, only inferred from stroke weight).
+        stroke_width_std: Standard deviation of stroke thickness, in
+            pixels -- a proxy for how *consistent* pressure is across the
+            sample.
+        letter_size_estimate: Proxy for average character/stroke height,
+            in pixels.
+        line_spacing_mean: Average vertical whitespace gap between
+            detected text lines, in pixels.
+        word_spacing_mean: Average horizontal gap between detected
+            word/stroke clusters within a line, in pixels.
+        baseline_slope_degrees: Trend of the baseline across a line, in
+            degrees. Positive means the baseline rises (moves toward
+            smaller row/pixel-y, i.e. up the page) left-to-right;
+            negative means it falls.
+        margin_left_px: Whitespace to the left of the ink content's
+            bounding box, in pixels.
+        margin_right_px: Whitespace to the right of the ink content's
+            bounding box, in pixels.
+        margin_top_px: Whitespace above the ink content's bounding box,
+            in pixels.
+        margin_bottom_px: Whitespace below the ink content's bounding
+            box, in pixels.
+        ink_density: Fraction of foreground (ink) pixels within the
+            content bounding box, in [0, 1] -- a rough proxy for rhythm
+            and continuity of stroke (see ``docs/labeling_rubric.md``'s
+            "Rhythm" / "Stroke Continuity" indicators).
+        confidence: Maps each of the above field names to a 0-1
+            confidence score. See :func:`_build_confidence` for the
+            heuristic (in short: measurements built from very few
+            underlying observations -- e.g. a near-empty image with few
+            detected strokes or lines -- get a low score).
+    """
+
+    slant_angle_degrees: float
+    stroke_width_mean: float
+    stroke_width_std: float
+    letter_size_estimate: float
+    line_spacing_mean: float
+    word_spacing_mean: float
+    baseline_slope_degrees: float
+    margin_left_px: float
+    margin_right_px: float
+    margin_top_px: float
+    margin_bottom_px: float
+    ink_density: float
+    confidence: dict[str, float]
+
+
+#: The subset of :class:`Features` fields the `confidence` dict must cover
+#: (i.e. every field except `confidence` itself).
+FEATURE_CONFIDENCE_KEYS: tuple[str, ...] = tuple(
+    name for name in Features.__dataclass_fields__ if name != "confidence"
+)
+
+
+# --- image loading -----------------------------------------------------------
+
+
+def _load_image(image: ImageInput) -> Image.Image:
+    """Return a :class:`PIL.Image.Image` for either an image or a path."""
+    if isinstance(image, Image.Image):
+        return image
+    return Image.open(image)
+
+
+def _to_grayscale_array(image: Image.Image) -> np.ndarray:
+    """Convert a PIL image to a 2D float64 numpy array of grayscale values."""
+    return np.asarray(image.convert("L"), dtype=np.float64)
+
+
+# --- Otsu threshold (generic: pixel values or run/gap lengths) -------------
+
+
+def _otsu_threshold(values: np.ndarray) -> float:
+    """Return an Otsu threshold splitting ``values`` into two classes.
+
+    A minimal, dependency-free (no scipy/skimage) implementation: build a
+    histogram, then pick the bin boundary that maximizes between-class
+    variance. This is written generically over any 1D numeric array, not
+    just 0-255 grayscale pixels, so it can also split a distribution of
+    gap lengths into "small" and "large" clusters (see
+    :func:`_estimate_word_spacing`).
+
+    Returns the input's minimum value if ``values`` is empty or constant
+    (there is nothing to split).
+    """
+    values = np.asarray(values, dtype=np.float64).ravel()
+    if values.size == 0:
+        return 0.0
+    v_min, v_max = float(values.min()), float(values.max())
+    if v_min == v_max:
+        return v_min
+
+    hist, bin_edges = np.histogram(values, bins=_OTSU_HISTOGRAM_BINS, range=(v_min, v_max))
+    hist = hist.astype(np.float64)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    total = hist.sum()
+    sum_total = float(np.sum(hist * bin_centers))
+
+    weight_background = 0.0
+    sum_background = 0.0
+    best_threshold = float(bin_centers[0])
+    best_variance = -1.0
+
+    for i in range(hist.size):
+        weight_background += hist[i]
+        if weight_background == 0:
+            continue
+        weight_foreground = total - weight_background
+        if weight_foreground <= 0:
+            break
+        sum_background += hist[i] * bin_centers[i]
+        mean_background = sum_background / weight_background
+        mean_foreground = (sum_total - sum_background) / weight_foreground
+        between_class_variance = (
+            weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
+        )
+        if between_class_variance > best_variance:
+            best_variance = between_class_variance
+            best_threshold = float(bin_centers[i])
+
+    return best_threshold
+
+
+def _binarize(grayscale: np.ndarray) -> np.ndarray:
+    """Binarize a grayscale array into a boolean ink mask (True = ink).
+
+    Uses :func:`_otsu_threshold` to split pixels into two classes, then
+    assumes ink is the *minority* class by pixel count -- a safe
+    assumption for handwriting samples, where ink coverage is sparse
+    relative to background/page, regardless of whether ink is rendered
+    dark-on-light or light-on-dark.
+
+    A perfectly uniform image (no tonal variation at all) is treated as
+    containing no ink, since Otsu's threshold is degenerate in that case.
+    """
+    if grayscale.size == 0 or grayscale.max() == grayscale.min():
+        return np.zeros_like(grayscale, dtype=bool)
+
+    threshold = _otsu_threshold(grayscale)
+    low_mask = grayscale <= threshold
+    high_mask = ~low_mask
+    return low_mask if low_mask.sum() <= high_mask.sum() else high_mask
+
+
+# --- run-length analysis (stroke width / letter size / word gaps) ----------
+
+
+def _runs_1d(values: np.ndarray) -> np.ndarray:
+    """Return an (n_runs, 2) array of [start, end) index pairs of True runs.
+
+    ``end`` is exclusive, so a run's length is ``end - start``.
+    """
+    if values.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    padded = np.concatenate(([False], values, [False]))
+    diff = np.diff(padded.astype(np.int8))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    return np.stack([starts, ends], axis=1)
+
+
+def _run_lengths_rowwise(mask: np.ndarray) -> np.ndarray:
+    """Lengths of every True-run within each row of a 2D boolean array.
+
+    Each row is treated independently (a run never spans across a row
+    boundary): every row is edge-padded with False before differencing, so
+    a run that reaches a row's last column is still closed there. Fully
+    vectorized (no per-row Python loop) via a single pad + diff + where
+    over the whole array: ``np.where`` scans in row-major order, so the
+    rising-edge ("start") and falling-edge ("end") indices it returns are
+    already in matching row-by-row, left-to-right order and can be paired
+    positionally.
+
+    Applying this to ``mask.T`` gives column-wise (vertical) run lengths
+    instead.
+    """
+    if mask.size == 0:
+        return np.empty(0, dtype=np.int64)
+    padded = np.pad(mask, ((0, 0), (1, 1)), constant_values=False)
+    diff = np.diff(padded.astype(np.int8), axis=1)
+    _, start_cols = np.where(diff == 1)
+    _, end_cols = np.where(diff == -1)
+    return (end_cols - start_cols).astype(np.int64)
+
+
+def _robust_run_stats(runs: np.ndarray, scale_factor: float) -> tuple[float, float, int]:
+    """Mean/std of ``runs`` (scaled by ``scale_factor``), trimmed of outliers.
+
+    ``scale_factor`` corrects for the fact that a run-length measured
+    along a fixed row/column through a *slanted* stroke overstates the
+    stroke's true perpendicular thickness/length by roughly
+    ``1 / cos(slant)``; callers pass ``cos(slant_angle)`` to undo that.
+
+    Once enough runs exist, the extreme 5th/95th percentiles are dropped
+    before computing statistics, so that a small number of runs
+    contaminated by two strokes touching (an accidental horizontal/
+    vertical merge) don't dominate the mean. Returns ``(0.0, 0.0, 0)`` for
+    an empty input.
+    """
+    if runs.size == 0:
+        return 0.0, 0.0, 0
+
+    values = runs.astype(np.float64) * scale_factor
+    if values.size >= _MIN_RUNS_FOR_PERCENTILE_TRIM:
+        low, high = np.percentile(values, _RUN_PERCENTILE_TRIM)
+        trimmed = values[(values >= low) & (values <= high)]
+        if trimmed.size > 0:
+            values = trimmed
+
+    return float(values.mean()), float(values.std()), int(runs.size)
+
+
+# --- slant estimation --------------------------------------------------------
+
+
+def _estimate_slant_degrees(
+    ys: np.ndarray, xs: np.ndarray, bands: list[tuple[int, int]]
+) -> tuple[float, int]:
+    """Estimate the dominant stroke slant via a projection-profile shear search.
+
+    Crucially, this estimates slant *within each detected line band*
+    (see :func:`_detect_line_bands`) and combines the per-line estimates,
+    rather than searching over the whole image's ink pixels at once. A
+    whole-image search confounds real within-line slant with the
+    (unrelated) vertical offset between separate lines: shearing by
+    ``tan(candidate) * y`` shifts each line by a different amount since
+    each line sits at a different y, which can spuriously "align" text
+    across lines at the wrong candidate angle -- especially for
+    repetitive synthetic content -- and swamp the much smaller, real
+    within-line signal. Restricting the search to one line band's narrow
+    y-range at a time avoids that. Per-band angles are combined with a
+    pixel-count-weighted average.
+
+    If no line bands were detected (e.g. very sparse ink), falls back to
+    a single whole-image search over all ink pixels.
+
+    Returns ``(angle_degrees, n_pixels_used)``; the pixel count feeds the
+    confidence heuristic.
+    """
+    if not bands:
+        return _estimate_slant_for_pixels(ys, xs)
+
+    angles: list[float] = []
+    weights: list[int] = []
+    for start, end in bands:
+        in_band = (ys >= start) & (ys < end)
+        if not np.any(in_band):
+            continue
+        angle, n = _estimate_slant_for_pixels(ys[in_band], xs[in_band])
+        if n >= _MIN_INK_PIXELS_FOR_SLANT:
+            angles.append(angle)
+            weights.append(n)
+
+    if not angles:
+        return _estimate_slant_for_pixels(ys, xs)
+
+    mean_angle = float(np.average(angles, weights=weights))
+    return mean_angle, int(sum(weights))
+
+
+def _estimate_slant_for_pixels(ys: np.ndarray, xs: np.ndarray) -> tuple[float, int]:
+    """Projection-profile shear search for the dominant slant of one pixel set.
+
+    For a stroke leaning at angle ``theta`` from vertical, a pixel at
+    ``(x, y)`` on that stroke satisfies ``x + tan(theta) * y == constant``
+    along the whole stroke (this matches the sign convention drawn by
+    :mod:`grafology_ai.dataset.fixtures`: positive ``theta`` means the top
+    of a stroke, at smaller y, is shifted to larger x, i.e. a rightward
+    lean). So for each candidate angle, this shears every ink pixel's x
+    coordinate by ``tan(candidate) * y`` and scores how "peaky" (sharply
+    concentrated into narrow columns) the resulting 1D histogram is; the
+    candidate whose shear best concentrates ink into columns -- meaning it
+    best cancels out the real slant -- is taken as the slant estimate.
+
+    This is a coarse statistical estimate over ink pixels, not a Hough
+    transform over individual line segments, and assumes a single
+    dominant slant across the given pixel set (mixed slants would average
+    out rather than being reported distinctly).
+
+    Returns ``(angle_degrees, n_pixels_used)``. Returns ``(0.0, n)``
+    without searching if there are too few ink pixels to trust an
+    estimate.
+    """
+    n = xs.size
+    if n < _MIN_INK_PIXELS_FOR_SLANT:
+        return 0.0, n
+
+    if n > _MAX_INK_PIXELS_FOR_SLANT_SAMPLE:
+        rng = np.random.default_rng(_SLANT_SAMPLE_SEED)
+        sample_idx = rng.choice(n, size=_MAX_INK_PIXELS_FOR_SLANT_SAMPLE, replace=False)
+        sample_ys = ys[sample_idx].astype(np.float64)
+        sample_xs = xs[sample_idx].astype(np.float64)
+    else:
+        sample_ys = ys.astype(np.float64)
+        sample_xs = xs.astype(np.float64)
+
+    best_angle = 0.0
+    best_score = -1.0
+    for angle in _SLANT_CANDIDATE_DEGREES:
+        theta = math.radians(float(angle))
+        sheared_x = sample_xs + math.tan(theta) * sample_ys
+        span = float(sheared_x.max() - sheared_x.min())
+        n_bins = max(1, int(math.ceil(span / _SLANT_BIN_WIDTH_PX)))
+        counts, _ = np.histogram(sheared_x, bins=n_bins)
+        score = float(np.sum(counts.astype(np.float64) ** 2))
+        if score > best_score:
+            best_score = score
+            best_angle = float(angle)
+
+    return best_angle, n
+
+
+# --- line-band detection (line spacing / baseline slope) -------------------
+
+
+def _detect_line_bands(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Detect approximate text-line row bands from the row ink-density profile.
+
+    Sums ink pixels per row, smooths that profile with a small moving
+    average (so a lifted pen between letters/words doesn't fragment one
+    visual line into several bands), then treats any row whose smoothed
+    density exceeds :data:`_LINE_BAND_THRESHOLD_FRACTION` of the profile's
+    peak as "inside a line". Contiguous runs of such rows are returned as
+    ``[start, end)`` row-index bands, in top-to-bottom order.
+
+    Returns an empty list if the mask has no ink at all.
+    """
+    if mask.shape[0] == 0:
+        return []
+    row_counts = mask.sum(axis=1).astype(np.float64)
+    if row_counts.max() <= 0:
+        return []
+
+    window = max(_LINE_SMOOTH_MIN_WINDOW, mask.shape[0] // 100)
+    kernel = np.ones(window, dtype=np.float64) / window
+    smoothed = np.convolve(row_counts, kernel, mode="same")
+
+    threshold = _LINE_BAND_THRESHOLD_FRACTION * smoothed.max()
+    line_rows = smoothed > threshold
+    runs = _runs_1d(line_rows)
+    return [(int(start), int(end)) for start, end in runs]
+
+
+def _mean_band_gap(bands: list[tuple[int, int]]) -> tuple[float, int]:
+    """Mean whitespace gap (rows) between consecutive line bands.
+
+    Returns ``(0.0, 0)`` if fewer than two bands were detected -- a
+    spacing measurement needs at least two lines to measure a gap between.
+    """
+    if len(bands) < 2:
+        return 0.0, 0
+    gaps = [
+        bands[i + 1][0] - bands[i][1]
+        for i in range(len(bands) - 1)
+        if bands[i + 1][0] - bands[i][1] > 0
+    ]
+    if not gaps:
+        return 0.0, 0
+    return float(np.mean(gaps)), len(gaps)
+
+
+def _estimate_baseline_slope(
+    mask: np.ndarray, bands: list[tuple[int, int]]
+) -> tuple[float, int]:
+    """Estimate baseline trend (rise/fall across a line), in degrees.
+
+    For each detected line band, finds the bottom-most ink row at every
+    ink-containing column (a descender-insensitive proxy for that column's
+    position on the baseline) and fits a line to (column, bottom_row) via
+    least squares. Per-band slopes are combined with a weighted average
+    (weighted by the number of columns each band's fit used), then
+    converted from a pixel-space slope to degrees, negated so that a
+    baseline that rises left-to-right (row index *decreases* as column
+    increases, since row 0 is the top of the image) is reported as a
+    *positive* degree value.
+
+    Returns ``(0.0, 0)`` if no band had enough ink-containing columns
+    (:data:`_MIN_COLUMNS_FOR_BASELINE_FIT`) to fit a line.
+    """
+    slopes: list[float] = []
+    weights: list[int] = []
+
+    for start, end in bands:
+        band = mask[start:end, :]
+        if band.shape[0] == 0:
+            continue
+        col_has_ink = band.any(axis=0)
+        cols = np.nonzero(col_has_ink)[0]
+        if cols.size < _MIN_COLUMNS_FOR_BASELINE_FIT:
+            continue
+
+        flipped = band[::-1, :]
+        first_true_from_bottom = np.argmax(flipped, axis=0)
+        bottom_row_local = band.shape[0] - 1 - first_true_from_bottom
+        bottom_rows = bottom_row_local[cols].astype(np.float64) + start
+
+        slope_pixel = float(np.polyfit(cols.astype(np.float64), bottom_rows, 1)[0])
+        slopes.append(slope_pixel)
+        weights.append(int(cols.size))
+
+    if not slopes:
+        return 0.0, 0
+
+    mean_slope_pixel = float(np.average(slopes, weights=weights))
+    return -math.degrees(math.atan(mean_slope_pixel)), int(sum(weights))
+
+
+# --- word spacing ------------------------------------------------------------
+
+
+def _estimate_word_spacing(
+    mask: np.ndarray, bands: list[tuple[int, int]]
+) -> tuple[float, int]:
+    """Estimate average horizontal word-gap (pixels) within detected lines.
+
+    Within each line band, projects ink onto columns (does this column
+    contain any ink within the band?) and measures the horizontal gaps
+    between consecutive ink-column runs -- i.e. between stroke/letter
+    clusters. Handwriting has two gap scales (tight intra-word/
+    letter-to-letter gaps, and wider inter-word gaps); once enough gaps
+    are collected, :func:`_otsu_threshold` splits them into these two
+    clusters and only the larger ("word") cluster is averaged. With too
+    few gaps to split meaningfully, all detected gaps are averaged as a
+    fallback.
+
+    Returns ``(0.0, 0)`` if no gaps were found at all.
+    """
+    all_gaps: list[int] = []
+    for start, end in bands:
+        band = mask[start:end, :]
+        if band.shape[0] == 0:
+            continue
+        col_has_ink = band.any(axis=0)
+        clusters = _runs_1d(col_has_ink)
+        if clusters.shape[0] < 2:
+            continue
+        gaps = clusters[1:, 0] - clusters[:-1, 1]
+        all_gaps.extend(int(g) for g in gaps if g > 0)
+
+    if not all_gaps:
+        return 0.0, 0
+
+    gaps_array = np.array(all_gaps, dtype=np.float64)
+    if gaps_array.size < _MIN_GAPS_FOR_OTSU_SPLIT:
+        return float(gaps_array.mean()), int(gaps_array.size)
+
+    threshold = _otsu_threshold(gaps_array)
+    word_gaps = gaps_array[gaps_array > threshold]
+    if word_gaps.size == 0:
+        word_gaps = gaps_array
+    return float(word_gaps.mean()), int(word_gaps.size)
+
+
+# --- confidence ---------------------------------------------------------------
+
+
+def _confidence_scale(n: int, full_at: int) -> float:
+    """Linearly ramp confidence from 0 to 1.0 as ``n`` approaches ``full_at``."""
+    if full_at <= 0:
+        return 0.0
+    return float(min(1.0, max(0.0, n / full_at)))
+
+
+def _build_confidence(
+    *,
+    slant_n: int,
+    width_n: int,
+    height_n: int,
+    line_gap_n: int,
+    word_gap_n: int,
+    baseline_n: int,
+    has_ink: bool,
+) -> dict[str, float]:
+    """Build the per-field confidence heuristic described on :class:`Features`.
+
+    Two kinds of indicators get two kinds of confidence:
+
+    - Statistically-estimated indicators (slant, stroke width, letter
+      size, line/word spacing, baseline slope) scale with how many
+      underlying observations (ink pixels, runs, gaps, fitted columns)
+      the estimate was built from, via :func:`_confidence_scale` --
+      few observations (e.g. a near-empty image with barely any detected
+      strokes or lines) means low confidence.
+    - Directly-measured geometric indicators (margins, ink density) are
+      near-exact once *any* ink is found (they're a bounding box and a
+      pixel-count ratio, not a statistical estimate), so they get a flat
+      high/low split on whether any ink exists at all.
+    """
+    geometric_confidence = 1.0 if has_ink else 0.0
+    confidence = {
+        "slant_angle_degrees": _confidence_scale(slant_n, _CONF_FULL_AT_SLANT_PIXELS),
+        "stroke_width_mean": _confidence_scale(width_n, _CONF_FULL_AT_RUNS),
+        "stroke_width_std": _confidence_scale(width_n, _CONF_FULL_AT_RUNS),
+        "letter_size_estimate": _confidence_scale(height_n, _CONF_FULL_AT_RUNS),
+        "line_spacing_mean": _confidence_scale(line_gap_n, _CONF_FULL_AT_LINE_GAPS),
+        "word_spacing_mean": _confidence_scale(word_gap_n, _CONF_FULL_AT_WORD_GAPS),
+        "baseline_slope_degrees": _confidence_scale(baseline_n, _CONF_FULL_AT_BASELINE_COLUMNS),
+        "margin_left_px": geometric_confidence,
+        "margin_right_px": geometric_confidence,
+        "margin_top_px": geometric_confidence,
+        "margin_bottom_px": geometric_confidence,
+        "ink_density": geometric_confidence,
+    }
+    # Belt-and-suspenders clamp: every value must land in [0, 1].
+    return {key: min(1.0, max(0.0, value)) for key, value in confidence.items()}
+
+
+def _empty_features(width: int, height: int) -> Features:
+    """Return a sane, NaN-free :class:`Features` for a blank/near-empty image.
+
+    All numeric measurements default to 0.0 (there is no content to
+    measure) and every confidence score is 0.0 (there is nothing to be
+    confident about), rather than raising or returning NaN/infinite
+    values. ``width``/``height`` are accepted for symmetry with the
+    non-empty path but are not otherwise needed, since 0.0 is used
+    uniformly rather than e.g. reporting margins equal to the full image
+    extent.
+    """
+    del width, height  # unused; kept for call-site symmetry/documentation
+    zero_confidence = {key: 0.0 for key in FEATURE_CONFIDENCE_KEYS}
+    return Features(
+        slant_angle_degrees=0.0,
+        stroke_width_mean=0.0,
+        stroke_width_std=0.0,
+        letter_size_estimate=0.0,
+        line_spacing_mean=0.0,
+        word_spacing_mean=0.0,
+        baseline_slope_degrees=0.0,
+        margin_left_px=0.0,
+        margin_right_px=0.0,
+        margin_top_px=0.0,
+        margin_bottom_px=0.0,
+        ink_density=0.0,
+        confidence=zero_confidence,
+    )
+
+
+def analyze(image: ImageInput) -> Features:
+    """Extract heuristic graphological :class:`Features` from a handwriting image.
+
+    Accepts a :class:`PIL.Image.Image` or a path to an image file (``str``
+    or ``os.PathLike``), matching the interface used across this project
+    (see :mod:`grafology_ai.validation.validators`).
+
+    This is a classical-image-processing heuristic, not a trained model:
+    it makes simplifying assumptions (a single dominant slant per sample,
+    descender-insensitive baselines, run-length proxies for stroke
+    width/letter size rather than full connected-component labeling --
+    see the module docstring) and its measurements should be read as
+    approximate, directionally-meaningful signals rather than precise
+    ground truth. Every returned value is finite (no NaN/inf); a blank or
+    near-empty image (no detectable ink) returns zeroed measurements with
+    zero confidence rather than raising.
+    """
+    pil_image = _load_image(image)
+    grayscale = _to_grayscale_array(pil_image)
+    height, width = grayscale.shape
+
+    ink_mask = _binarize(grayscale)
+    ys, xs = np.nonzero(ink_mask)
+    n_ink = int(xs.size)
+
+    if n_ink == 0:
+        return _empty_features(width, height)
+
+    # Margins + ink density, from the ink content's bounding box.
+    y_min, y_max = int(ys.min()), int(ys.max())
+    x_min, x_max = int(xs.min()), int(xs.max())
+    margin_left = float(x_min)
+    margin_right = float(width - 1 - x_max)
+    margin_top = float(y_min)
+    margin_bottom = float(height - 1 - y_max)
+
+    bbox_mask = ink_mask[y_min : y_max + 1, x_min : x_max + 1]
+    bbox_area = bbox_mask.shape[0] * bbox_mask.shape[1]
+    ink_density = float(bbox_mask.sum()) / bbox_area if bbox_area > 0 else 0.0
+
+    # Line bands drive line spacing, baseline slope, word spacing, and (see
+    # below) slant -- detected first since slant is estimated per band.
+    bands = _detect_line_bands(ink_mask)
+
+    # Slant (needed before stroke-width/letter-size: their run lengths are
+    # corrected by the estimated slant, see _robust_run_stats).
+    slant_angle_degrees, slant_n = _estimate_slant_degrees(ys, xs, bands)
+    slant_correction = math.cos(math.radians(slant_angle_degrees))
+
+    # Stroke width (pressure proxy): row-wise horizontal run lengths.
+    row_runs = _run_lengths_rowwise(ink_mask)
+    row_runs = row_runs[row_runs > 0]
+    stroke_width_mean, stroke_width_std, width_n = _robust_run_stats(
+        row_runs, slant_correction
+    )
+
+    # Letter size proxy: column-wise vertical run lengths.
+    col_runs = _run_lengths_rowwise(ink_mask.T)
+    col_runs = col_runs[col_runs > 0]
+    letter_size_estimate, _letter_size_std, height_n = _robust_run_stats(
+        col_runs, slant_correction
+    )
+
+    line_spacing_mean, line_gap_n = _mean_band_gap(bands)
+    baseline_slope_degrees, baseline_n = _estimate_baseline_slope(ink_mask, bands)
+    word_spacing_mean, word_gap_n = _estimate_word_spacing(ink_mask, bands)
+
+    confidence = _build_confidence(
+        slant_n=slant_n,
+        width_n=width_n,
+        height_n=height_n,
+        line_gap_n=line_gap_n,
+        word_gap_n=word_gap_n,
+        baseline_n=baseline_n,
+        has_ink=True,
+    )
+
+    return Features(
+        slant_angle_degrees=slant_angle_degrees,
+        stroke_width_mean=stroke_width_mean,
+        stroke_width_std=stroke_width_std,
+        letter_size_estimate=letter_size_estimate,
+        line_spacing_mean=line_spacing_mean,
+        word_spacing_mean=word_spacing_mean,
+        baseline_slope_degrees=baseline_slope_degrees,
+        margin_left_px=margin_left,
+        margin_right_px=margin_right,
+        margin_top_px=margin_top,
+        margin_bottom_px=margin_bottom,
+        ink_density=ink_density,
+        confidence=confidence,
+    )

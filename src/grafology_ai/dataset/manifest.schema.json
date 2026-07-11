@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://congen.it/grafology-ai/schemas/manifest-entry.schema.json",
+  "title": "GrafologyAI Dataset Manifest Entry",
+  "description": "A single sample entry in a graphological handwriting-sample dataset manifest. Consistent field-for-field with grafology_ai.dataset.schema.ManifestEntry.",
+  "type": "object",
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Anonymous identifier for the sample. Must not contain personally identifying information."
+    },
+    "acquisition_method": {
+      "type": "string",
+      "enum": ["photo", "scan"],
+      "description": "How the sample was captured: a photograph or a document/flatbed scan."
+    },
+    "quality": {
+      "type": "string",
+      "enum": ["high", "medium", "low"],
+      "description": "Subjective image-quality rating of the sample."
+    },
+    "language": {
+      "type": ["string", "null"],
+      "description": "Language the handwriting sample was written in (e.g. 'it', 'en'), or null if unknown/not recorded."
+    },
+    "labels": {
+      "type": "object",
+      "description": "Ground-truth ('gold') labels from professional graphologists, mapping indicator name (e.g. 'slant', 'pressure') to a label/value string. Empty when the sample is not yet labeled.",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    }
+  },
+  "required": ["sample_id", "acquisition_method", "quality"],
+  "additionalProperties": false
+}
