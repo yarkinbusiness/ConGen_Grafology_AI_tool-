@@ -65,6 +65,7 @@ def _make_features(stroke_width_mean: float, stroke_width_std: float = 0.5) -> F
         ink_density=0.2,
         rhythm_regularity=0.5,
         stroke_connectedness=0.5,
+        organization_score=0.5,
         confidence=confidence,
     )
 

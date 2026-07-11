@@ -197,6 +197,70 @@ _STROKE_CONNECTEDNESS_MAX_SEGMENTS_PER_WORD = 4.0
 #: reliable than one built from many.
 _CONF_FULL_AT_STROKE_SEGMENTS = 20
 
+# --- overall organization ------------------------------------------------------
+
+#: Minimum number of per-band observations (inter-band gaps, per-band
+#: left-edge columns, or per-band baseline slopes) a single ingredient of
+#: the :func:`_build_organization_score` composite needs before its
+#: consistency sub-score is considered meaningful at all -- the same
+#: reasoning as :data:`_RHYTHM_MIN_OBSERVATIONS`: a "spread" computed from
+#: 0 or 1 points isn't a consistency measurement, it's noise. An
+#: ingredient with fewer observations than this is dropped from the
+#: composite and the remaining weights renormalized (see
+#: :func:`_build_organization_score`), the same pattern
+#: :func:`_build_rhythm_regularity` uses.
+_ORG_MIN_OBSERVATIONS = 2
+
+#: Equal weights for the three organization ingredients -- inter-band
+#: vertical spacing consistency, per-band left-edge (line-start) column
+#: alignment consistency, and per-band baseline-slope consistency. The
+#: labeling rubric's Overall Organization definition ("alignment of
+#: lines, use of space... apparent planning of layout") does not
+#: prioritize any one of these over the others, so -- matching the
+#: equal-weighting-with-renormalization choice already made for
+#: :data:`_RHYTHM_WEIGHT_LINE_HEIGHT` and friends -- they are weighted
+#: equally by default; when an ingredient is unusable (see
+#: :data:`_ORG_MIN_OBSERVATIONS`) the remaining weights are renormalized
+#: rather than treating a missing ingredient as "perfectly organized".
+_ORG_WEIGHT_BAND_SPACING = 1.0 / 3.0
+_ORG_WEIGHT_LEFT_EDGE = 1.0 / 3.0
+_ORG_WEIGHT_BASELINE_SLOPE = 1.0 / 3.0
+
+#: A per-band left-edge standard deviation at or beyond this fraction of
+#: the ink content's bounding-box width is treated as maximally ragged
+#: line-start alignment (score 0.0 in :func:`_build_organization_score`);
+#: the ingredient decays linearly from 1.0 (std == 0, every line starts at
+#: exactly the same column) down to 0.0 as the std approaches this
+#: fraction of content width. Expressing the threshold as a *fraction of
+#: content width* -- rather than a fixed pixel count -- keeps it
+#: meaningful regardless of image resolution or how wide the handwriting
+#: sample happens to be, the same concern :data:`_SLANT_BIN_WIDTH_PX`'s
+#: docstring raises about fixed-vs-scaled measurements.
+_ORG_LEFT_EDGE_MAX_STD_FRACTION = 0.25
+
+#: A per-band baseline-slope standard deviation (degrees) at or beyond
+#: this many degrees is treated as maximally wandering/inconsistent
+#: line-to-line baselines (score 0.0 in :func:`_build_organization_score`);
+#: decays linearly from 1.0 (std == 0, every line's baseline trend is
+#: identical) down to 0.0 as the std approaches this many degrees.
+#: Degrees are already resolution-independent (unlike a raw pixel
+#: threshold), so no additional normalization is needed here. Chosen much
+#: tighter than the +/-60 degree :data:`_SLANT_CANDIDATE_DEGREES` search
+#: range used for overall stroke slant, since line-to-line baseline
+#: *wander* is a subtler, smaller-magnitude organization signal than
+#: overall stroke slant.
+_ORG_BASELINE_SLOPE_STD_MAX_DEGREES = 8.0
+
+#: "Full confidence" line-band-count threshold for organization_score:
+#: confidence ramps up via :func:`_confidence_scale` as the number of
+#: *detected* line bands (not any per-pixel/per-run observation count)
+#: approaches this many. Organization is inherently a cross-line
+#: comparison -- reading it off a single detected line is close to
+#: meaningless, since there is nothing to compare that line against -- so
+#: this threshold is deliberately set high enough that a single detected
+#: band always lands strictly below 0.5 confidence (1 / 4 == 0.25).
+_CONF_FULL_AT_ORGANIZATION_BANDS = 4
+
 
 @dataclass(frozen=True)
 class Features:
@@ -259,6 +323,22 @@ class Features:
             "words" those segments form (more segments per word implies
             more pen lifts) -- see :func:`_stroke_connectedness_per_band`
             and :func:`_build_stroke_connectedness`.
+        organization_score: Overall layout organization of the sample, in
+            [0, 1] where 1.0 means a highly organized layout (evenly
+            spaced lines, consistently aligned line starts, level
+            baselines line to line), per ``docs/labeling_rubric.md``'s
+            "Overall Organization" indicator ("alignment of lines, use of
+            space, and apparent planning of layout"). A weighted composite
+            of three per-line-band consistency ingredients -- inter-band
+            vertical spacing, left-edge (line-start) column alignment, and
+            baseline-slope consistency (reusing
+            :func:`_estimate_baseline_slope`'s per-band fits) -- see
+            :func:`_build_organization_score`. Unlike every other
+            statistically-estimated field, this field's confidence scales
+            with the *number of detected line bands* rather than a
+            per-pixel/per-run count, since organization is inherently a
+            cross-line comparison a single line cannot support -- see
+            :data:`_CONF_FULL_AT_ORGANIZATION_BANDS`.
         confidence: Maps each of the above field names to a 0-1
             confidence score. See :func:`_build_confidence` for the
             heuristic (in short: measurements built from very few
@@ -280,6 +360,7 @@ class Features:
     ink_density: float
     rhythm_regularity: float
     stroke_connectedness: float
+    organization_score: float
     confidence: dict[str, float]
 
 
@@ -580,41 +661,70 @@ def _detect_line_bands(mask: np.ndarray) -> list[tuple[int, int]]:
     return [(int(start), int(end)) for start, end in runs]
 
 
-def _mean_band_gap(bands: list[tuple[int, int]]) -> tuple[float, int]:
-    """Mean whitespace gap (rows) between consecutive line bands.
+def _band_gaps(bands: list[tuple[int, int]]) -> list[float]:
+    """Return the individual whitespace gaps (rows) between consecutive line bands.
 
-    Returns ``(0.0, 0)`` if fewer than two bands were detected -- a
-    spacing measurement needs at least two lines to measure a gap between.
+    Extracted as its own function (rather than inlined in
+    :func:`_mean_band_gap`) so callers that need the raw list of gap
+    lengths -- not just their mean -- can reuse it without re-deriving it;
+    the same "expose the list, make the mean a thin wrapper" pattern
+    :func:`_word_gaps` uses relative to :func:`_estimate_word_spacing`.
+    See :func:`_build_organization_score`, which needs the spread of
+    inter-band gaps, not merely their average.
+
+    Returns an empty list if fewer than two bands were detected, or if no
+    positive gap exists between any pair of consecutive bands.
     """
     if len(bands) < 2:
-        return 0.0, 0
+        return []
     gaps = [
         bands[i + 1][0] - bands[i][1]
         for i in range(len(bands) - 1)
         if bands[i + 1][0] - bands[i][1] > 0
     ]
+    return [float(g) for g in gaps]
+
+
+def _mean_band_gap(bands: list[tuple[int, int]]) -> tuple[float, int]:
+    """Mean whitespace gap (rows) between consecutive line bands.
+
+    Thin wrapper around :func:`_band_gaps`. Returns ``(0.0, 0)`` if fewer
+    than two bands were detected, or no positive gap exists -- a spacing
+    measurement needs at least two lines to measure a gap between.
+    """
+    gaps = _band_gaps(bands)
     if not gaps:
         return 0.0, 0
     return float(np.mean(gaps)), len(gaps)
 
 
-def _estimate_baseline_slope(
+def _baseline_slopes_per_band(
     mask: np.ndarray, bands: list[tuple[int, int]]
-) -> tuple[float, int]:
-    """Estimate baseline trend (rise/fall across a line), in degrees.
+) -> tuple[list[float], list[int]]:
+    """Per-line-band pixel-space baseline slope and its column-count weight.
 
     For each detected line band, finds the bottom-most ink row at every
     ink-containing column (a descender-insensitive proxy for that column's
     position on the baseline) and fits a line to (column, bottom_row) via
-    least squares. Per-band slopes are combined with a weighted average
-    (weighted by the number of columns each band's fit used), then
-    converted from a pixel-space slope to degrees, negated so that a
-    baseline that rises left-to-right (row index *decreases* as column
-    increases, since row 0 is the top of the image) is reported as a
-    *positive* degree value.
+    least squares -- the same per-band fit :func:`_estimate_baseline_slope`
+    combines into one whole-sample estimate. Extracted as its own function
+    (the same "expose the per-band list, make the aggregate a thin
+    wrapper" pattern as :func:`_word_gaps` relative to
+    :func:`_estimate_word_spacing`) so callers that need the *spread* of
+    per-band slopes -- not just their combined average -- can reuse it
+    without re-deriving it; see :func:`_build_organization_score`.
 
-    Returns ``(0.0, 0)`` if no band had enough ink-containing columns
-    (:data:`_MIN_COLUMNS_FOR_BASELINE_FIT`) to fit a line.
+    A band with fewer than :data:`_MIN_COLUMNS_FOR_BASELINE_FIT`
+    ink-containing columns is skipped entirely (not padded with a
+    fabricated 0.0 slope), matching :func:`_per_band_run_stats`'s
+    convention for unmeasurable bands.
+
+    Returns ``(slopes, weights)``, parallel lists of one entry per band
+    that had enough ink-containing columns to fit a line: raw
+    pixel-space slopes (rows of vertical shift per column, *before* the
+    degree conversion and sign negation :func:`_estimate_baseline_slope`
+    applies), and each fit's ink-containing-column count (usable both as
+    a combination weight and as an observation-count confidence input).
     """
     slopes: list[float] = []
     weights: list[int] = []
@@ -637,6 +747,25 @@ def _estimate_baseline_slope(
         slopes.append(slope_pixel)
         weights.append(int(cols.size))
 
+    return slopes, weights
+
+
+def _estimate_baseline_slope(
+    mask: np.ndarray, bands: list[tuple[int, int]]
+) -> tuple[float, int]:
+    """Estimate baseline trend (rise/fall across a line), in degrees.
+
+    Thin wrapper around :func:`_baseline_slopes_per_band`: combines its
+    per-band pixel-space slopes with a weighted average (weighted by the
+    number of columns each band's fit used), then converts from a
+    pixel-space slope to degrees, negated so that a baseline that rises
+    left-to-right (row index *decreases* as column increases, since row 0
+    is the top of the image) is reported as a *positive* degree value.
+
+    Returns ``(0.0, 0)`` if no band had enough ink-containing columns
+    (:data:`_MIN_COLUMNS_FOR_BASELINE_FIT`) to fit a line.
+    """
+    slopes, weights = _baseline_slopes_per_band(mask, bands)
     if not slopes:
         return 0.0, 0
 
@@ -931,6 +1060,122 @@ def _build_stroke_connectedness(scores: list[float], weights: list[int]) -> floa
     return float(min(1.0, max(0.0, weighted_sum / total_weight)))
 
 
+# --- overall organization ------------------------------------------------------
+
+
+def _band_left_edges(mask: np.ndarray, bands: list[tuple[int, int]]) -> list[float]:
+    """Leftmost ink-containing column (pixels) within each detected line band.
+
+    One value per band that contains any ink at all -- a proxy for where
+    each line "starts" on the page, used by
+    :func:`_build_organization_score` to measure how consistently lines
+    are left-aligned to one another (the labeling rubric's "alignment of
+    lines" language). A band with no ink at all (should not normally
+    occur, since bands are themselves detected from an ink-density
+    profile) is skipped rather than padded with a fabricated value.
+    """
+    edges: list[float] = []
+    for start, end in bands:
+        band = mask[start:end, :]
+        if band.shape[0] == 0:
+            continue
+        col_has_ink = band.any(axis=0)
+        cols = np.nonzero(col_has_ink)[0]
+        if cols.size == 0:
+            continue
+        edges.append(float(cols.min()))
+    return edges
+
+
+def _threshold_consistency_score(spread: float, max_spread: float) -> float:
+    """Linear-decay consistency score: 1.0 at ``spread == 0``, 0.0 at/beyond ``max_spread``.
+
+    Used by the line-start-alignment and baseline-slope-consistency
+    ingredients of :func:`_build_organization_score`, whose underlying
+    quantities (a column position in pixels, a slope in degrees) don't
+    share a natural positive "typical scale" the way the rhythm
+    ingredients' coefficient-of-variation composite
+    (:func:`_inverse_cv_score`) relies on -- a column position can
+    legitimately be near zero, and a slope can be zero or negative, either
+    of which would make a CV-style ``std / mean`` ratio undefined or
+    misleading. A simple spread-vs-threshold linear decay avoids that,
+    mirroring the shape of decay :func:`_stroke_connectedness_per_band`
+    already uses for its segments-per-word ratio.
+
+    Returns 0.0 if ``max_spread`` is not positive (nothing to normalize
+    against).
+    """
+    if max_spread <= 0:
+        return 0.0
+    return float(min(1.0, max(0.0, 1.0 - spread / max_spread)))
+
+
+def _build_organization_score(
+    band_gap_values: list[float],
+    left_edge_values: list[float],
+    baseline_slope_degree_values: list[float],
+    content_width_px: float,
+) -> float:
+    """Composite organization_score in [0, 1] (1.0 = highly organized layout).
+
+    A weighted average of three consistency sub-scores, per
+    ``docs/labeling_rubric.md``'s Overall Organization definition
+    ("alignment of lines, use of space... apparent planning of layout"):
+
+    - Inter-band vertical spacing consistency: :func:`_inverse_cv_score`
+      over the list of gaps between consecutive detected line bands (the
+      same technique :func:`_build_rhythm_regularity` uses for its
+      ingredients -- a gap length is a naturally positive quantity with a
+      meaningful "typical scale", its own mean).
+    - Left-edge (line-start) alignment consistency: how tightly clustered
+      each band's leftmost ink column is, scored by
+      :func:`_threshold_consistency_score` against
+      :data:`_ORG_LEFT_EDGE_MAX_STD_FRACTION` of the content width.
+    - Baseline-slope consistency: how tightly clustered each band's
+      baseline slope (in degrees, reusing
+      :func:`_baseline_slopes_per_band`'s per-band fits) is, scored by
+      :func:`_threshold_consistency_score` against
+      :data:`_ORG_BASELINE_SLOPE_STD_MAX_DEGREES`.
+
+    Weights are :data:`_ORG_WEIGHT_BAND_SPACING`,
+    :data:`_ORG_WEIGHT_LEFT_EDGE`, :data:`_ORG_WEIGHT_BASELINE_SLOPE`
+    (equal by default -- see their docstring for the reasoning). An
+    ingredient with fewer than :data:`_ORG_MIN_OBSERVATIONS` observations
+    is dropped from the composite and the remaining weights renormalized,
+    the same pattern :func:`_build_rhythm_regularity` uses. Returns 0.0 if
+    no ingredient has enough observations at all (e.g. 0 or 1 detected
+    line bands).
+    """
+    scores_and_weights: list[tuple[float, float]] = []
+
+    if len(band_gap_values) >= _ORG_MIN_OBSERVATIONS:
+        scores_and_weights.append(
+            (_inverse_cv_score(band_gap_values), _ORG_WEIGHT_BAND_SPACING)
+        )
+
+    if len(left_edge_values) >= _ORG_MIN_OBSERVATIONS and content_width_px > 0:
+        left_edge_std = float(np.asarray(left_edge_values, dtype=np.float64).std())
+        max_std = _ORG_LEFT_EDGE_MAX_STD_FRACTION * content_width_px
+        scores_and_weights.append(
+            (_threshold_consistency_score(left_edge_std, max_std), _ORG_WEIGHT_LEFT_EDGE)
+        )
+
+    if len(baseline_slope_degree_values) >= _ORG_MIN_OBSERVATIONS:
+        slope_std = float(np.asarray(baseline_slope_degree_values, dtype=np.float64).std())
+        scores_and_weights.append(
+            (
+                _threshold_consistency_score(slope_std, _ORG_BASELINE_SLOPE_STD_MAX_DEGREES),
+                _ORG_WEIGHT_BASELINE_SLOPE,
+            )
+        )
+
+    total_weight = sum(weight for _score, weight in scores_and_weights)
+    if total_weight <= 0:
+        return 0.0
+    weighted_sum = sum(score * weight for score, weight in scores_and_weights)
+    return float(min(1.0, max(0.0, weighted_sum / total_weight)))
+
+
 # --- confidence ---------------------------------------------------------------
 
 
@@ -952,6 +1197,7 @@ def _build_confidence(
     rhythm_height_band_n: int,
     rhythm_width_band_n: int,
     stroke_connectedness_segment_n: int,
+    organization_band_n: int,
     has_ink: bool,
 ) -> dict[str, float]:
     """Build the per-field confidence heuristic described on :class:`Features`.
@@ -987,6 +1233,19 @@ def _build_confidence(
     :func:`_stroke_connectedness_per_band` -- few segments (few detected
     line bands / sparse ink) means the segments-per-word ratio the score
     is built from is not well supported.
+
+    ``organization_score`` is a fourth, deliberately different case: its
+    confidence does *not* scale with any per-pixel/per-run observation
+    count the way every other statistically-estimated field above does.
+    Instead it scales directly with ``organization_band_n`` (the number of
+    *detected line bands*), via :func:`_confidence_scale` against
+    :data:`_CONF_FULL_AT_ORGANIZATION_BANDS`. This is intentional:
+    organization is inherently a cross-line comparison (spacing between
+    lines, alignment of one line's start against another's, slope
+    consistency line to line), so no amount of ink/runs/columns *within* a
+    single line can make an organization read off that one line
+    trustworthy -- the threshold is chosen so a single detected band
+    always lands strictly below 0.5 confidence.
     """
     geometric_confidence = 1.0 if has_ink else 0.0
     rhythm_confidence = (
@@ -1010,6 +1269,9 @@ def _build_confidence(
         "rhythm_regularity": rhythm_confidence,
         "stroke_connectedness": _confidence_scale(
             stroke_connectedness_segment_n, _CONF_FULL_AT_STROKE_SEGMENTS
+        ),
+        "organization_score": _confidence_scale(
+            organization_band_n, _CONF_FULL_AT_ORGANIZATION_BANDS
         ),
     }
     # Belt-and-suspenders clamp: every value must land in [0, 1].
@@ -1044,6 +1306,7 @@ def _empty_features(width: int, height: int) -> Features:
         ink_density=0.0,
         rhythm_regularity=0.0,
         stroke_connectedness=0.0,
+        organization_score=0.0,
         confidence=zero_confidence,
     )
 
@@ -1135,6 +1398,23 @@ def analyze(image: ImageInput) -> Features:
         connectedness_scores, connectedness_weights
     )
 
+    # Overall organization: inter-band spacing / left-edge / baseline-slope
+    # consistency across line bands (see _build_organization_score).
+    # _baseline_slopes_per_band is called again here (rather than reusing
+    # the per-band fits _estimate_baseline_slope computed internally above)
+    # to keep _estimate_baseline_slope a self-contained, independently
+    # correct thin wrapper -- the extra per-band linear fits are cheap.
+    band_gaps = _band_gaps(bands)
+    band_left_edges = _band_left_edges(ink_mask, bands)
+    baseline_slopes_px, _baseline_slope_weights = _baseline_slopes_per_band(ink_mask, bands)
+    baseline_slope_degrees_per_band = [
+        -math.degrees(math.atan(slope)) for slope in baseline_slopes_px
+    ]
+    content_width_px = float(x_max - x_min)
+    organization_score = _build_organization_score(
+        band_gaps, band_left_edges, baseline_slope_degrees_per_band, content_width_px
+    )
+
     confidence = _build_confidence(
         slant_n=slant_n,
         width_n=width_n,
@@ -1145,6 +1425,7 @@ def analyze(image: ImageInput) -> Features:
         rhythm_height_band_n=len(rhythm_heights),
         rhythm_width_band_n=len(rhythm_widths),
         stroke_connectedness_segment_n=int(sum(connectedness_weights)),
+        organization_band_n=len(bands),
         has_ink=True,
     )
 
@@ -1163,5 +1444,6 @@ def analyze(image: ImageInput) -> Features:
         ink_density=ink_density,
         rhythm_regularity=rhythm_regularity,
         stroke_connectedness=stroke_connectedness,
+        organization_score=organization_score,
         confidence=confidence,
     )

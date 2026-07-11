@@ -570,3 +570,141 @@ def test_stroke_connectedness_confidence_within_unit_interval() -> None:
     for image in (rich_image, sparse_image.convert("RGB"), _blank_image()):
         features = analyze(image)
         assert 0.0 <= features.confidence["stroke_connectedness"] <= 1.0
+
+
+# --- overall organization ---------------------------------------------------
+
+
+def _draw_organization_grid(
+    size: tuple[int, int],
+    *,
+    line_specs: list[tuple[int, int, float]],
+    stroke_width: int = 4,
+    stroke_height: int = 16,
+    stroke_spacing: int = 14,
+    n_strokes_per_line: int = 12,
+) -> Image.Image:
+    """A grid of strokes with independently controllable per-line placement.
+
+    ``line_specs`` is one ``(x_start, y_top, slope_px_per_stroke)`` triple
+    per drawn line -- direct, known-ground-truth control over the three
+    quantities the ``organization_score`` composite measures:
+
+    - ``x_start``: that line's left-edge starting column (controls
+      line-start alignment across lines).
+    - ``y_top``: the vertical position of the line's first stroke
+      (choosing evenly- vs unevenly-spaced ``y_top`` values across lines
+      controls inter-band spacing consistency).
+    - ``slope_px_per_stroke``: shifts each successive stroke's bottom row
+      by this many pixels (0 = perfectly level baseline; nonzero = a
+      straight but tilted baseline for that line, and varying it line to
+      line builds baseline-slope inconsistency).
+    """
+    image = Image.new("L", size, color=BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for x_start, y_top, slope_px_per_stroke in line_specs:
+        x = x_start
+        for i in range(n_strokes_per_line):
+            y_bottom = y_top + stroke_height + int(round(slope_px_per_stroke * i))
+            draw.line(
+                [(x, y_bottom), (x, y_bottom - stroke_height)], fill=INK, width=stroke_width
+            )
+            x += stroke_spacing
+    return image.convert("RGB")
+
+
+# Evenly-spaced (50px pitch) line starts, all left-aligned to the same
+# column, perfectly level (non-wandering) baselines -- 4 bands.
+_ORGANIZED_LINE_SPECS: list[tuple[int, int, float]] = [
+    (30, 30, 0.0),
+    (30, 80, 0.0),
+    (30, 130, 0.0),
+    (30, 180, 0.0),
+]
+
+# Unevenly-spaced line starts (gaps of 40, 90, 30 rows), ragged left-edge
+# starting columns (30, 90, 15, 70), and mixed/wandering per-line slopes
+# (0, 2, -3, 1.5 px/stroke) -- also 4 bands, so the comparison isolates
+# the organization signal from the confidence-band-count effect.
+_DISORGANIZED_LINE_SPECS: list[tuple[int, int, float]] = [
+    (30, 30, 0.0),
+    (90, 70, 2.0),
+    (15, 160, -3.0),
+    (70, 190, 1.5),
+]
+
+
+def test_organization_score_field_and_confidence_key_exist() -> None:
+    assert "organization_score" in Features.__dataclass_fields__
+    assert "organization_score" in FEATURE_CONFIDENCE_KEYS
+
+    features = analyze(_draw_organization_grid((500, 400), line_specs=_ORGANIZED_LINE_SPECS))
+    assert "organization_score" in features.confidence
+
+
+def test_organized_layout_scores_higher_than_disorganized_layout() -> None:
+    organized_image = _draw_organization_grid((500, 400), line_specs=_ORGANIZED_LINE_SPECS)
+    disorganized_image = _draw_organization_grid(
+        (500, 400), line_specs=_DISORGANIZED_LINE_SPECS
+    )
+
+    organized_features = analyze(organized_image)
+    disorganized_features = analyze(disorganized_image)
+
+    assert organized_features.organization_score > disorganized_features.organization_score
+
+
+def test_organization_score_within_unit_interval_and_finite_across_fixture_dataset(
+    tmp_path: Path,
+) -> None:
+    entries = generate_fixture_dataset(tmp_path / "raw", count=12, seed=1)
+    images_dir = tmp_path / "raw" / "images"
+
+    for entry in entries:
+        features = analyze(images_dir / f"{entry.sample_id}.png")
+        assert math.isfinite(features.organization_score)
+        assert 0.0 <= features.organization_score <= 1.0
+        assert math.isfinite(features.confidence["organization_score"])
+        assert 0.0 <= features.confidence["organization_score"] <= 1.0
+
+
+def test_analyze_blank_image_organization_score_and_confidence_are_zero() -> None:
+    features = analyze(_blank_image())
+    assert features.organization_score == 0.0
+    assert features.confidence["organization_score"] == 0.0
+
+
+def test_organization_score_is_deterministic_across_repeated_analyze_calls() -> None:
+    image = _draw_organization_grid((500, 400), line_specs=_DISORGANIZED_LINE_SPECS)
+
+    first = analyze(image)
+    second = analyze(image)
+
+    assert first.organization_score == second.organization_score
+    assert first.confidence["organization_score"] == second.confidence["organization_score"]
+
+
+def test_organization_score_confidence_is_low_for_a_single_detected_line_band() -> None:
+    # A single short line of strokes: _detect_line_bands finds exactly one
+    # band, so an organization read off it is near-meaningless and
+    # confidence must be strictly below 0.5 by construction.
+    single_line_image = Image.new("L", (400, 200), color=BACKGROUND)
+    draw = ImageDraw.Draw(single_line_image)
+    x = 30
+    for _ in range(12):
+        draw.line([(x, 80), (x, 64)], fill=INK, width=4)
+        x += 14
+
+    features = analyze(single_line_image.convert("RGB"))
+    assert features.confidence["organization_score"] < 0.5
+
+
+def test_organization_score_confidence_within_unit_interval() -> None:
+    rich_image = _draw_organization_grid((500, 400), line_specs=_ORGANIZED_LINE_SPECS)
+    sparse_image = Image.new("L", (200, 200), color=BACKGROUND)
+    draw = ImageDraw.Draw(sparse_image)
+    draw.line([(100, 100), (102, 90)], fill=INK, width=1)
+
+    for image in (rich_image, sparse_image.convert("RGB"), _blank_image()):
+        features = analyze(image)
+        assert 0.0 <= features.confidence["organization_score"] <= 1.0
