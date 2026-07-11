@@ -448,3 +448,125 @@ def test_rhythm_regularity_confidence_within_unit_interval() -> None:
     for image in (rich_image, sparse_image.convert("RGB"), _blank_image()):
         features = analyze(image)
         assert 0.0 <= features.confidence["rhythm_regularity"] <= 1.0
+
+
+# --- stroke connectedness -------------------------------------------------
+
+
+def _draw_connected_lines(
+    size: tuple[int, int] = (600, 300),
+    *,
+    n_lines: int = 4,
+    ink_width: int = 300,
+    bar_height: int = 8,
+    margin: int = 30,
+    line_pitch: int = 50,
+) -> Image.Image:
+    """Several horizontal lines, each one continuous unbroken ink bar.
+
+    Simulates fully joined, cursive-like strokes: within each detected
+    line band there is exactly one ink-column-run segment (no pen lifts
+    at all), which is the maximally-connected case.
+    """
+    image = Image.new("L", size, color=BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for i in range(n_lines):
+        y0 = margin + i * line_pitch
+        draw.rectangle([margin, y0, margin + ink_width - 1, y0 + bar_height - 1], fill=INK)
+    return image.convert("RGB")
+
+
+def _draw_broken_lines(
+    size: tuple[int, int] = (600, 300),
+    *,
+    n_lines: int = 4,
+    n_segments: int = 15,
+    dash_width: int = 20,
+    gap_width: int = 10,
+    bar_height: int = 8,
+    margin: int = 30,
+    line_pitch: int = 50,
+) -> Image.Image:
+    """The same horizontal lines as :func:`_draw_connected_lines`, dashed.
+
+    Same line positions and same *total ink width* per line
+    (``n_segments * dash_width``) as the continuous bar in
+    :func:`_draw_connected_lines` (with matching defaults, ``15 * 20 ==
+    300``), just rendered as ``n_segments`` short pieces separated by
+    ``gap_width``-pixel lifts instead of one continuous stroke --
+    simulating broken/printed, disconnected strokes with the ink amount
+    held constant so a comparison isolates connectedness from density.
+    """
+    image = Image.new("L", size, color=BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    for i in range(n_lines):
+        y0 = margin + i * line_pitch
+        x = margin
+        for _seg in range(n_segments):
+            draw.rectangle([x, y0, x + dash_width - 1, y0 + bar_height - 1], fill=INK)
+            x += dash_width + gap_width
+    return image.convert("RGB")
+
+
+def test_stroke_connectedness_field_and_confidence_key_exist() -> None:
+    assert "stroke_connectedness" in Features.__dataclass_fields__
+    assert "stroke_connectedness" in FEATURE_CONFIDENCE_KEYS
+
+    features = analyze(_draw_connected_lines())
+    assert "stroke_connectedness" in features.confidence
+
+
+def test_connected_strokes_score_higher_than_broken_strokes_with_matched_ink() -> None:
+    connected_image = _draw_connected_lines()
+    broken_image = _draw_broken_lines()
+
+    # Confirm the "matched ink amount" premise before comparing connectedness.
+    connected_ink = (np.asarray(connected_image.convert("L")) != BACKGROUND).sum()
+    broken_ink = (np.asarray(broken_image.convert("L")) != BACKGROUND).sum()
+    assert broken_ink == pytest.approx(connected_ink, rel=0.05)
+
+    connected_features = analyze(connected_image)
+    broken_features = analyze(broken_image)
+
+    assert connected_features.stroke_connectedness > broken_features.stroke_connectedness
+
+
+def test_stroke_connectedness_within_unit_interval_and_finite_across_fixture_dataset(
+    tmp_path: Path,
+) -> None:
+    entries = generate_fixture_dataset(tmp_path / "raw", count=12, seed=1)
+    images_dir = tmp_path / "raw" / "images"
+
+    for entry in entries:
+        features = analyze(images_dir / f"{entry.sample_id}.png")
+        assert math.isfinite(features.stroke_connectedness)
+        assert 0.0 <= features.stroke_connectedness <= 1.0
+        assert math.isfinite(features.confidence["stroke_connectedness"])
+        assert 0.0 <= features.confidence["stroke_connectedness"] <= 1.0
+
+
+def test_analyze_blank_image_stroke_connectedness_and_confidence_are_zero() -> None:
+    features = analyze(_blank_image())
+    assert features.stroke_connectedness == 0.0
+    assert features.confidence["stroke_connectedness"] == 0.0
+
+
+def test_stroke_connectedness_is_deterministic_across_repeated_analyze_calls() -> None:
+    image = _draw_broken_lines()
+
+    first = analyze(image)
+    second = analyze(image)
+
+    assert first.stroke_connectedness == second.stroke_connectedness
+    assert first.confidence["stroke_connectedness"] == second.confidence["stroke_connectedness"]
+
+
+def test_stroke_connectedness_confidence_within_unit_interval() -> None:
+    rich_image = _draw_broken_lines()
+    sparse_image = Image.new("L", (200, 200), color=BACKGROUND)
+    draw = ImageDraw.Draw(sparse_image)
+    draw.line([(100, 100), (102, 90)], fill=INK, width=1)
+
+    for image in (rich_image, sparse_image.convert("RGB"), _blank_image()):
+        features = analyze(image)
+        assert 0.0 <= features.confidence["stroke_connectedness"] <= 1.0

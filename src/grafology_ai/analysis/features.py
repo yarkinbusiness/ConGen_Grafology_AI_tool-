@@ -173,6 +173,30 @@ _RHYTHM_WEIGHT_STROKE_WIDTH = 1.0 / 3.0
 #: the exact same gap list as ``word_spacing_mean``.
 _CONF_FULL_AT_RHYTHM_BANDS = 3
 
+# --- stroke connectedness -----------------------------------------------------
+
+#: Segments-per-word ratio (ink-column-run segments in a line band, divided
+#: by that band's estimated word count -- see
+#: :func:`_stroke_connectedness_per_band`) at or above which
+#: stroke_connectedness saturates at 0.0 (maximally broken/lifted). A ratio
+#: of 1.0 (every word drawn as one unbroken run) is, by definition, the
+#: maximally connected case (score 1.0); this constant marks the opposite
+#: end of the scale. A typical short handwritten word rendered as roughly
+#: four separate disconnected pieces (e.g. every letter drawn as its own
+#: printed, unjoined stroke) already reads as about as broken as
+#: handwriting gets, so ratios at or beyond it are treated as equally
+#: "fully broken" rather than driving the score arbitrarily negative. The
+#: score decays linearly between these two ratios (1.0 -> 1.0 score,
+#: this constant -> 0.0 score).
+_STROKE_CONNECTEDNESS_MAX_SEGMENTS_PER_WORD = 4.0
+
+#: "Full confidence" sample-size threshold for stroke_connectedness: total
+#: ink-column-run segments, summed across every line band that yielded a
+#: usable word-count estimate. Matches the spirit of :data:`_CONF_FULL_AT_RUNS`
+#: -- a connectedness score built from a handful of segments is much less
+#: reliable than one built from many.
+_CONF_FULL_AT_STROKE_SEGMENTS = 20
+
 
 @dataclass(frozen=True)
 class Features:
@@ -225,6 +249,16 @@ class Features:
             inverse-coefficient-of-variation composite over per-line-band
             ink-run (letter) heights, word-gap lengths, and per-line-band
             stroke widths -- see :func:`_build_rhythm_regularity`.
+        stroke_connectedness: How joined/continuous vs. lifted/broken
+            handwriting strokes are, in [0, 1] where 1.0 means strokes
+            read as fully joined (few pen lifts) and 0.0 means strokes
+            read as fully segmented/printed, per
+            ``docs/labeling_rubric.md``'s "Stroke Continuity" indicator.
+            Within each detected line band, compares the count of
+            ink-column-run segments to an Otsu-split estimate of how many
+            "words" those segments form (more segments per word implies
+            more pen lifts) -- see :func:`_stroke_connectedness_per_band`
+            and :func:`_build_stroke_connectedness`.
         confidence: Maps each of the above field names to a 0-1
             confidence score. See :func:`_build_confidence` for the
             heuristic (in short: measurements built from very few
@@ -245,6 +279,7 @@ class Features:
     margin_bottom_px: float
     ink_density: float
     rhythm_regularity: float
+    stroke_connectedness: float
     confidence: dict[str, float]
 
 
@@ -784,6 +819,118 @@ def _build_rhythm_regularity(
     return float(min(1.0, max(0.0, weighted_sum / total_weight)))
 
 
+# --- stroke connectedness -----------------------------------------------------
+
+
+def _stroke_connectedness_per_band(
+    mask: np.ndarray, bands: list[tuple[int, int]]
+) -> tuple[list[float], list[int]]:
+    """Per-line-band (score, segment_count) for the stroke_connectedness composite.
+
+    Within each line band, ink is projected onto columns and grouped into
+    ink-column-run "segments" -- runs of columns that touch ink somewhere
+    in the band, separated by columns with no ink at all. This is the same
+    clustering :func:`_word_gaps` performs; it is recomputed here (rather
+    than calling :func:`_word_gaps`) because that function only returns
+    the pooled word-scale gap *values*, not the per-band segment counts
+    and per-band word-gap counts this composite needs.
+
+    The gaps between consecutive segments are classified into intra-word
+    ("letter") vs inter-word ("word") gaps via one :func:`_otsu_threshold`
+    split computed over *every* band's gaps pooled together -- mirroring
+    :func:`_word_gaps`'s split (so the two features agree on what counts as
+    a "word" gap), but computed once globally rather than per band, since
+    a single band rarely has enough gaps on its own to support a reliable
+    split. A band's estimated word count is then ``(number of word-level
+    gaps in that band) + 1``; comparing that to the band's total segment
+    count gives a segments-per-word ratio -- 1.0 means every word was
+    drawn as one continuous run (fully connected), larger ratios mean
+    words were broken into multiple lifted-pen pieces. The ratio is mapped
+    to a [0, 1] score via :data:`_STROKE_CONNECTEDNESS_MAX_SEGMENTS_PER_WORD`.
+
+    If there are too few gaps overall (:data:`_MIN_GAPS_FOR_OTSU_SPLIT`) to
+    support a meaningful split, every gap is treated as word-level
+    (mirroring :func:`_word_gaps`'s own fallback for the same case), which
+    makes every segment its own "word" -- a deliberately neutral (maximally
+    connected) default for when there isn't enough evidence to say a
+    segment boundary represents a broken stroke rather than genuine word
+    spacing.
+
+    Returns two parallel lists, one entry per band that contained at least
+    one segment: per-band connectedness scores in [0, 1], and per-band
+    segment counts (used both as aggregation weights in
+    :func:`_build_stroke_connectedness` and as the raw quantity
+    :func:`_build_confidence` scales confidence on). Bands with no ink at
+    all are skipped entirely (not scored as "disconnected").
+    """
+    band_clusters: list[np.ndarray] = []
+    band_gaps: list[list[int]] = []
+    all_gaps: list[int] = []
+
+    for start, end in bands:
+        band = mask[start:end, :]
+        if band.shape[0] == 0:
+            continue
+        col_has_ink = band.any(axis=0)
+        clusters = _runs_1d(col_has_ink)
+        if clusters.shape[0] == 0:
+            continue
+        band_clusters.append(clusters)
+        if clusters.shape[0] < 2:
+            band_gaps.append([])
+            continue
+        gaps = [int(g) for g in (clusters[1:, 0] - clusters[:-1, 1]) if g > 0]
+        band_gaps.append(gaps)
+        all_gaps.extend(gaps)
+
+    if not band_clusters:
+        return [], []
+
+    use_word_level_fallback = len(all_gaps) < _MIN_GAPS_FOR_OTSU_SPLIT
+    threshold = (
+        _otsu_threshold(np.array(all_gaps, dtype=np.float64)) if all_gaps else None
+    )
+
+    scores: list[float] = []
+    weights: list[int] = []
+    span = _STROKE_CONNECTEDNESS_MAX_SEGMENTS_PER_WORD - 1.0
+    for clusters, gaps in zip(band_clusters, band_gaps):
+        n_segments = int(clusters.shape[0])
+        if use_word_level_fallback or threshold is None:
+            n_words = n_segments
+        else:
+            n_word_gaps = sum(1 for g in gaps if g > threshold)
+            n_words = n_word_gaps + 1
+        if n_words <= 0:
+            continue
+
+        ratio = n_segments / n_words
+        if span > 0:
+            score = 1.0 - (ratio - 1.0) / span
+        else:
+            score = 1.0 if ratio <= 1.0 else 0.0
+        scores.append(float(min(1.0, max(0.0, score))))
+        weights.append(n_segments)
+
+    return scores, weights
+
+
+def _build_stroke_connectedness(scores: list[float], weights: list[int]) -> float:
+    """Weighted-average stroke_connectedness composite in [0, 1].
+
+    Combines :func:`_stroke_connectedness_per_band`'s per-band scores with
+    a segment-count-weighted average, so a band whose estimate rests on
+    many measured segments (more evidence) influences the overall score
+    more than one built from only a couple of strokes. Returns 0.0 if no
+    band produced a usable score.
+    """
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return 0.0
+    weighted_sum = sum(score * weight for score, weight in zip(scores, weights))
+    return float(min(1.0, max(0.0, weighted_sum / total_weight)))
+
+
 # --- confidence ---------------------------------------------------------------
 
 
@@ -804,6 +951,7 @@ def _build_confidence(
     baseline_n: int,
     rhythm_height_band_n: int,
     rhythm_width_band_n: int,
+    stroke_connectedness_segment_n: int,
     has_ink: bool,
 ) -> dict[str, float]:
     """Build the per-field confidence heuristic described on :class:`Features`.
@@ -831,6 +979,14 @@ def _build_confidence(
     should read as *less* trustworthy than one built from all three, even
     though the value's own renormalization means it doesn't look
     "wrong" -- confidence is where that missing evidence should show up.
+
+    ``stroke_connectedness`` follows the same statistically-estimated
+    pattern as stroke width/letter size: it scales with
+    ``stroke_connectedness_segment_n``, the total count of ink-column-run
+    segments that contributed a usable per-band score in
+    :func:`_stroke_connectedness_per_band` -- few segments (few detected
+    line bands / sparse ink) means the segments-per-word ratio the score
+    is built from is not well supported.
     """
     geometric_confidence = 1.0 if has_ink else 0.0
     rhythm_confidence = (
@@ -852,6 +1008,9 @@ def _build_confidence(
         "margin_bottom_px": geometric_confidence,
         "ink_density": geometric_confidence,
         "rhythm_regularity": rhythm_confidence,
+        "stroke_connectedness": _confidence_scale(
+            stroke_connectedness_segment_n, _CONF_FULL_AT_STROKE_SEGMENTS
+        ),
     }
     # Belt-and-suspenders clamp: every value must land in [0, 1].
     return {key: min(1.0, max(0.0, value)) for key, value in confidence.items()}
@@ -884,6 +1043,7 @@ def _empty_features(width: int, height: int) -> Features:
         margin_bottom_px=0.0,
         ink_density=0.0,
         rhythm_regularity=0.0,
+        stroke_connectedness=0.0,
         confidence=zero_confidence,
     )
 
@@ -966,6 +1126,15 @@ def analyze(image: ImageInput) -> Features:
     rhythm_heights, rhythm_widths = _per_band_run_stats(ink_mask, bands, slant_correction)
     rhythm_regularity = _build_rhythm_regularity(rhythm_heights, word_gaps, rhythm_widths)
 
+    # Stroke connectedness: per-line-band segments-per-word ratio, combined
+    # via a segment-count-weighted average (see _build_stroke_connectedness).
+    connectedness_scores, connectedness_weights = _stroke_connectedness_per_band(
+        ink_mask, bands
+    )
+    stroke_connectedness = _build_stroke_connectedness(
+        connectedness_scores, connectedness_weights
+    )
+
     confidence = _build_confidence(
         slant_n=slant_n,
         width_n=width_n,
@@ -975,6 +1144,7 @@ def analyze(image: ImageInput) -> Features:
         baseline_n=baseline_n,
         rhythm_height_band_n=len(rhythm_heights),
         rhythm_width_band_n=len(rhythm_widths),
+        stroke_connectedness_segment_n=int(sum(connectedness_weights)),
         has_ink=True,
     )
 
@@ -992,5 +1162,6 @@ def analyze(image: ImageInput) -> Features:
         margin_bottom_px=margin_bottom,
         ink_density=ink_density,
         rhythm_regularity=rhythm_regularity,
+        stroke_connectedness=stroke_connectedness,
         confidence=confidence,
     )
