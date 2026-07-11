@@ -216,7 +216,7 @@ This in-depth overview draws on a handful of measurable handwriting features to 
 
 **Confidence:** medium confidence (50%)
 
-### Ink flow (rhythm)
+### Rhythm
 
 **Observation:** Ink density within the writing area is measured at 0.10, indicating a sparser flow of ink.
 

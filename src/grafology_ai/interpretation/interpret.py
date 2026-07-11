@@ -5,9 +5,9 @@ measurements into cautious, human-readable findings.
 -- it reports numbers, not judgments (see its module docstring). This
 module is the next stage: it maps those numbers onto the indicator
 vocabulary documented in ``docs/labeling_rubric.md`` (slant, pressure,
-letter size, spacing, baseline movement, margins, rhythm/stroke
-continuity) and attaches short, hedged, descriptive narrative text to
-each one.
+letter size, spacing, baseline movement, margins, rhythm, stroke
+continuity, overall organization) and attaches short, hedged, descriptive
+narrative text to each one.
 
 This is explicitly *not* a diagnostic layer. Every piece of generated
 text is written to the same standard ``docs/labeling_rubric.md`` sets for
@@ -196,6 +196,8 @@ INDICATOR_ORDER: tuple[str, ...] = (
     "margins_horizontal",
     "margins_vertical",
     "rhythm",
+    "stroke_continuity",
+    "organization",
 )
 
 #: Human-readable label for each indicator, used when rendering
@@ -210,7 +212,9 @@ INDICATOR_LABELS: dict[str, str] = {
     "baseline": "Baseline steadiness",
     "margins_horizontal": "Left/right margin balance",
     "margins_vertical": "Top/bottom margin balance",
-    "rhythm": "Ink flow (rhythm)",
+    "rhythm": "Rhythm",
+    "stroke_continuity": "Stroke continuity",
+    "organization": "Overall organization",
 }
 
 #: Which single :class:`~grafology_ai.analysis.Features` confidence-dict
@@ -234,7 +238,9 @@ INDICATOR_CONFIDENCE_KEY: dict[str, str] = {
     "baseline": "baseline_slope_degrees",
     "margins_horizontal": "margin_left_px",
     "margins_vertical": "margin_top_px",
-    "rhythm": "ink_density",
+    "rhythm": "rhythm_regularity",
+    "stroke_continuity": "stroke_connectedness",
+    "organization": "organization_score",
 }
 
 
@@ -306,14 +312,34 @@ MARGIN_NEAR_EDGE_MAX_PX = 5.0
 #: "balanced".
 MARGIN_IMBALANCE_RATIO = 2.0
 
-#: Ink density (fraction of the content bounding box covered by ink, in
-#: [0, 1] -- already scale-independent, unlike the pixel-based cutoffs
-#: above): at or below this reads as "low" (sparser/more broken-looking
-#: ink flow); at or above `INK_DENSITY_HIGH_MIN`, "high"; in between,
-#: "moderate". See ``Features.ink_density``'s docstring, which ties this
-#: measurement to the rubric's "Rhythm" / "Stroke Continuity" indicators.
-INK_DENSITY_LOW_MAX = 0.15
-INK_DENSITY_HIGH_MIN = 0.35
+#: Rhythm regularity (`Features.rhythm_regularity`, an inverse-CV
+#: composite in [0, 1] where 1.0 means highly regular/evenly-repeating
+#: stroke shape, size, and spacing -- see that field's docstring): at or
+#: below this reads as "irregular" (halting, unevenly repeating); at or
+#: above `RHYTHM_REGULAR_MIN`, "regular"; in between, a moderate middle
+#: band. Distinct from the old `INK_DENSITY_LOW_MAX`/`INK_DENSITY_HIGH_MIN`
+#: cutoffs this indicator used before A4 -- those described ink coverage
+#: (a density fraction), this describes regularity of repetition, a
+#: different [0, 1] scale entirely.
+RHYTHM_IRREGULAR_MAX = 0.35
+RHYTHM_REGULAR_MIN = 0.65
+
+#: Stroke continuity (`Features.stroke_connectedness`, in [0, 1] where 1.0
+#: means strokes read as fully joined/continuous and 0.0 means fully
+#: segmented/printed -- see that field's docstring): at or below this
+#: reads as "broken/segmented"; at or above
+#: `STROKE_CONNECTEDNESS_CONNECTED_MIN`, "connected/joined"; in between, a
+#: "partially joined" middle band.
+STROKE_CONNECTEDNESS_BROKEN_MAX = 0.35
+STROKE_CONNECTEDNESS_CONNECTED_MIN = 0.65
+
+#: Overall organization (`Features.organization_score`, in [0, 1] where
+#: 1.0 means a highly organized/planned layout -- see that field's
+#: docstring): at or below this reads as "loosely organized"; at or above
+#: `ORGANIZATION_PLANNED_MIN`, "planned, consistent"; in between, a
+#: moderately organized middle band.
+ORGANIZATION_LOOSE_MAX = 0.35
+ORGANIZATION_PLANNED_MIN = 0.65
 
 #: How many indicators `depth="concise"` reports (out of the
 #: `len(INDICATOR_ORDER)` available at `depth="indepth"`). Picked to keep
@@ -882,44 +908,146 @@ def _candidate_margins_vertical(features: Features) -> _Candidate:
 
 
 def _candidate_rhythm(features: Features) -> _Candidate:
-    density = features.ink_density
+    regularity = features.rhythm_regularity
 
-    if density <= INK_DENSITY_LOW_MAX:
-        descriptor = "a sparser, more broken-looking flow of ink"
+    if regularity <= RHYTHM_IRREGULAR_MAX:
+        descriptor = "an irregular, unevenly repeating rhythm of stroke shape, size, and spacing"
         full = (
-            "A sparser ink flow is sometimes associated with a more segmented, "
-            "deliberate communication style -- pausing or lifting the pen more "
-            "often -- though this also commonly reflects a fine pen, a fast writing "
-            "speed, or a printed (rather than joined) writing style."
+            "An irregular rhythm like this is sometimes associated with a more "
+            "variable, shifting pace of expression from word to word or line to "
+            "line, though this also commonly reflects a short or hurried sample, "
+            "an unfamiliar writing surface, or simply natural variation across a "
+            "small amount of writing."
         )
-        brief = "A sparser ink flow sometimes points to a more segmented, deliberate communication style."
+        brief = "An irregular rhythm sometimes points to a more variable, shifting pace of expression."
         tag: Literal["typical", "notable"] = "notable"
-    elif density >= INK_DENSITY_HIGH_MIN:
-        descriptor = "a denser, more continuous flow of ink"
+    elif regularity >= RHYTHM_REGULAR_MIN:
+        descriptor = "a regular, evenly repeating rhythm of stroke shape, size, and spacing"
         full = (
-            "A denser, more continuous ink flow is sometimes associated with a "
-            "more fluid, connected communication style and an easier flow from one "
-            "thought to the next, though this also reflects pen type and a joined "
-            "(cursive-leaning) writing style."
+            "A regular, evenly repeating rhythm is often associated with a fairly "
+            "steady, practiced pace of expression and a consistent working tempo "
+            "across the sample, though a short or simple sample can also read as "
+            "regular just by having little room to vary."
         )
-        brief = "A denser, more continuous ink flow sometimes points to a more fluid, connected communication style."
-        tag = "notable"
+        brief = "A regular, evenly repeating rhythm often points to a steady, practiced pace of expression."
+        tag = "typical"
     else:
-        descriptor = "a moderate, evenly balanced flow of ink"
+        descriptor = "a moderately regular rhythm, neither markedly even nor markedly uneven"
         full = (
-            "A moderate, balanced ink flow is often associated with a fairly even, "
-            "adaptable communication rhythm, neither markedly halting nor markedly "
-            "continuous."
+            "A moderate rhythm reading is often associated with a fairly typical, "
+            "adaptable pace of expression, neither notably steady nor notably "
+            "variable."
         )
-        brief = "A moderate ink flow often points to a fairly even, adaptable communication rhythm."
+        brief = "A moderate rhythm reading often points to a fairly typical, adaptable pace of expression."
         tag = "typical"
 
     observation = (
-        f"Ink density within the writing area is measured at {density:.2f} "
-        f"(fraction of the bounding box covered by ink), indicating {descriptor}."
+        f"Rhythm regularity is measured at {regularity:.2f} (a 0-1 composite of "
+        "how evenly stroke shape, size, and spacing repeat across the sample), "
+        f"indicating {descriptor}."
     )
     return _Candidate(
         "rhythm", observation, full, brief, _confidence_for(features, "rhythm"), descriptor, tag
+    )
+
+
+def _candidate_stroke_continuity(features: Features) -> _Candidate:
+    connectedness = features.stroke_connectedness
+
+    if connectedness <= STROKE_CONNECTEDNESS_BROKEN_MAX:
+        descriptor = "strokes that read as noticeably broken or segmented, with frequent apparent pen lifts"
+        full = (
+            "Frequently broken or lifted strokes are sometimes associated with a "
+            "more deliberate, step-by-step style of thought or expression -- "
+            "pausing between pieces of a word -- though this also commonly reflects "
+            "a printed (rather than cursive) writing style, a fine pen, or simply "
+            "an unhurried pace."
+        )
+        brief = "Frequently broken strokes sometimes point to a more deliberate, step-by-step style of expression."
+        tag: Literal["typical", "notable"] = "notable"
+    elif connectedness >= STROKE_CONNECTEDNESS_CONNECTED_MIN:
+        descriptor = "strokes that read as mostly joined and continuous, with few apparent pen lifts"
+        full = (
+            "Mostly joined, continuous strokes are sometimes associated with a "
+            "more fluid flow from one thought to the next and an easier transition "
+            "between ideas while writing, though this also commonly reflects a "
+            "cursive-leaning writing style learned early on or simply a faster "
+            "writing pace."
+        )
+        brief = "Mostly joined strokes sometimes point to a more fluid flow from one thought to the next."
+        tag = "typical"
+    else:
+        descriptor = "strokes with a moderate mix of joined and broken sections"
+        full = (
+            "A moderate mix of joined and broken strokes is often associated with "
+            "a fairly adaptable style of expression, neither markedly continuous "
+            "nor markedly segmented."
+        )
+        brief = "A moderate mix of joined and broken strokes often points to a fairly adaptable style of expression."
+        tag = "typical"
+
+    observation = (
+        f"Stroke connectedness is measured at {connectedness:.2f} (a 0-1 score "
+        "comparing detected stroke segments to estimated word count within each "
+        f"line), indicating {descriptor}."
+    )
+    return _Candidate(
+        "stroke_continuity",
+        observation,
+        full,
+        brief,
+        _confidence_for(features, "stroke_continuity"),
+        descriptor,
+        tag,
+    )
+
+
+def _candidate_organization(features: Features) -> _Candidate:
+    score = features.organization_score
+
+    if score <= ORGANIZATION_LOOSE_MAX:
+        descriptor = "a loosely organized layout, with uneven line spacing, ragged line starts, or wandering baselines"
+        full = (
+            "A loosely organized layout is sometimes associated with a more "
+            "spontaneous, in-the-moment approach to arranging written work, though "
+            "this also commonly reflects an unruled page, a rushed sample, or "
+            "unfamiliar writing conditions rather than anything about planning "
+            "style generally."
+        )
+        brief = "A loosely organized layout sometimes points to a more spontaneous approach to arranging written work."
+        tag: Literal["typical", "notable"] = "notable"
+    elif score >= ORGANIZATION_PLANNED_MIN:
+        descriptor = "a consistently organized layout, with evenly spaced lines, aligned line starts, and level baselines"
+        full = (
+            "A consistently organized layout is often associated with a planned, "
+            "methodical approach to arranging written work, though a short or "
+            "simple sample can also read as organized just by having little room "
+            "to drift."
+        )
+        brief = "A consistently organized layout often points to a planned, methodical approach to arranging work."
+        tag = "typical"
+    else:
+        descriptor = "a moderately organized layout, neither notably consistent nor notably uneven"
+        full = (
+            "A moderately organized layout is often associated with a fairly "
+            "typical, adaptable approach to arranging written work on the page."
+        )
+        brief = "A moderately organized layout often points to a fairly typical, adaptable approach to arranging work."
+        tag = "typical"
+
+    observation = (
+        f"Overall organization is measured at {score:.2f} (a 0-1 composite of "
+        "inter-line spacing, line-start alignment, and baseline consistency "
+        f"across the sample), indicating {descriptor}."
+    )
+    return _Candidate(
+        "organization",
+        observation,
+        full,
+        brief,
+        _confidence_for(features, "organization"),
+        descriptor,
+        tag,
     )
 
 
@@ -935,6 +1063,8 @@ _CANDIDATE_BUILDERS = (
     _candidate_margins_horizontal,
     _candidate_margins_vertical,
     _candidate_rhythm,
+    _candidate_stroke_continuity,
+    _candidate_organization,
 )
 
 
@@ -1055,8 +1185,8 @@ def interpret(features: Features, depth: Depth = "indepth") -> StructuredFinding
     `INDICATOR_ORDER` (one `Finding` per measured `Features` field
     group -- slant, pressure/stroke-width [mean and consistency], letter
     size, line spacing, word spacing, baseline, margins [horizontal and
-    vertical], and ink density/rhythm), with the fuller narrative text
-    for each.
+    vertical], rhythm, stroke continuity, and overall organization), with
+    the fuller narrative text for each.
 
     At `depth="concise"`, `findings` is restricted to the
     `CONCISE_INDICATOR_COUNT` indicators with the *highest* confidence
