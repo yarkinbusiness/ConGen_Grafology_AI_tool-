@@ -161,7 +161,7 @@ validate_sample()  ->  analyze()  ->  interpret()  ->  generate_report()
 | Stage | Function | Lives in | What it does |
 |---|---|---|---|
 | 1. Validate | `validate_sample()` | `src/grafology_ai/validation/validators.py` | Automated image-quality checks (format, resolution, blur, contrast). Returns a list of accept/reject/flag verdicts; never blocks the rest of the pipeline (see design note below). |
-| 2. Analyze | `analyze()` | `src/grafology_ai/analysis/features.py` | Classical image-processing feature extraction (Pillow + numpy only): slant, stroke width (pressure proxy), letter size, line/word spacing, baseline slope, margins, ink density -- plus a per-field confidence score. Returns a `Features` record of plain numbers, no interpretation attached. |
+| 2. Analyze | `analyze()` | `src/grafology_ai/analysis/features.py` | Classical image-processing feature extraction (Pillow + numpy only): slant, stroke width (pressure proxy), letter size, line/word spacing, baseline slope, margins, ink density, rhythm regularity, stroke continuity, and overall layout organization -- plus a per-field confidence score. Returns a `Features` record of plain numbers, no interpretation attached. |
 | 3. Interpret | `interpret()` | `src/grafology_ai/interpretation/interpret.py` | Maps `Features` onto the indicator vocabulary in `docs/labeling_rubric.md` and attaches short, hedged, non-diagnostic narrative text to each one. Supports two depths (`"concise"`, `"indepth"`). Enforces its own language discipline against a denylist (`DISALLOWED_TERMS`) of diagnostic/absolute/evaluative language. Returns a `StructuredFindings` record (per-indicator findings, strengths, areas of attention, an overall summary). |
 | 4. Report | `generate_report()` / `save_report()` | `src/grafology_ai/report/generator.py` | Renders a `StructuredFindings` into a fixed-section markdown report (header, disclaimer, overall summary, per-indicator findings with confidence, strengths, areas of attention, closing note) as-is -- it never rewrites or embellishes the interpretation layer's text. |
 
@@ -192,7 +192,8 @@ per-sample analysis pipeline above:
 
 **`analyze()` today is a classical image-processing heuristic, not a
 trained machine-learning model.** It measures slant, stroke width,
-spacing, baseline, and margins directly from pixels using from-scratch
+spacing, baseline, margins, rhythm regularity, stroke continuity, and
+overall layout organization directly from pixels using from-scratch
 Otsu thresholding, run-length analysis, and a projection-profile shear
 search -- documented assumptions and simplifications throughout
 `src/grafology_ai/analysis/features.py`. It is a *stand-in*, used because

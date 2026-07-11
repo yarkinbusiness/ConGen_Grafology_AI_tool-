@@ -303,9 +303,14 @@ class Features:
         margin_bottom_px: Whitespace below the ink content's bounding
             box, in pixels.
         ink_density: Fraction of foreground (ink) pixels within the
-            content bounding box, in [0, 1] -- a rough proxy for rhythm
-            and continuity of stroke (see ``docs/labeling_rubric.md``'s
-            "Rhythm" / "Stroke Continuity" indicators).
+            content bounding box, in [0, 1] -- a raw ink-coverage
+            measurement. It is still computed and populated here, but it
+            no longer backs any interpretation-layer indicator: the
+            ``"rhythm"`` and ``"stroke_continuity"`` indicators are keyed
+            off the dedicated ``rhythm_regularity`` and
+            ``stroke_connectedness`` fields below instead (see
+            ``docs/labeling_rubric.md``'s "Rhythm" / "Stroke Continuity"
+            indicators).
         rhythm_regularity: Regularity of repetition across the sample, in
             [0, 1] where 1.0 means highly regular/rhythmic, per
             ``docs/labeling_rubric.md``'s "Rhythm" indicator ("how evenly
