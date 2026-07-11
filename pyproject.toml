@@ -20,6 +20,7 @@ dev = ["pytest", "httpx"]
 
 [project.scripts]
 grafology-analyze = "grafology_ai.cli:main"
+grafology-intake = "grafology_ai.intake_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
