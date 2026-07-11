@@ -68,6 +68,7 @@ does not duplicate that logic.
 from __future__ import annotations
 
 import dataclasses
+import io
 import os
 from dataclasses import dataclass
 from typing import Union
@@ -75,24 +76,70 @@ from typing import Union
 from PIL import Image
 
 from grafology_ai.analysis import Features, analyze
+from grafology_ai.input.pdf import is_pdf, rasterize_pdf
 from grafology_ai.interpretation import DISALLOWED_TERMS, Depth, StructuredFindings, interpret
 from grafology_ai.report import generate_report
 from grafology_ai.validation import ValidationResult, validate_sample
 
-ImageInput = Union[Image.Image, str, "os.PathLike[str]"]
+ImageInput = Union[Image.Image, bytes, str, "os.PathLike[str]"]
 
 
-def _load_image(image: ImageInput) -> Image.Image:
-    """Return a :class:`PIL.Image.Image` for either an image or a path.
+@dataclass(frozen=True)
+class _LoadedSample:
+    """Internal: the in-memory image plus format/page metadata `run_analysis` needs.
 
-    Loading once here (rather than letting :func:`validate_sample` and
-    :func:`analyze` each independently re-open a path argument) means a
-    path is only opened once per :func:`run_analysis` call, and every
-    downstream stage sees the exact same in-memory image.
+    Attributes:
+        image: The loaded/rasterized :class:`PIL.Image.Image`.
+        declared_format: ``"PDF"`` when `image` came from rasterizing a
+            PDF page (so :func:`~grafology_ai.validation.validate_sample`
+            should trust that declared format rather than re-deriving
+            ``image.format``, which is ``None`` for a rasterized page);
+            ``None`` for a normally-loaded image, preserving existing
+            behavior exactly.
+        page_count: Total page count of the source PDF, or ``1`` for a
+            non-PDF input.
+    """
+
+    image: Image.Image
+    declared_format: str | None
+    page_count: int
+
+
+def _load_sample(image: ImageInput) -> _LoadedSample:
+    """Load `image` into memory, transparently rasterizing PDF input.
+
+    - An already-loaded :class:`PIL.Image.Image` is used as-is
+      (``declared_format=None``, ``page_count=1``) -- unchanged from
+      before PDF support existed.
+    - A path or raw ``bytes`` is first sniffed with
+      :func:`grafology_ai.input.pdf.is_pdf`; if it is a PDF, page 1 is
+      rasterized via :func:`grafology_ai.input.pdf.rasterize_pdf` (at the
+      default DPI) and ``declared_format="PDF"`` /
+      the source's real ``page_count`` are recorded.
+      :class:`~grafology_ai.input.pdf.PdfInputError` is allowed to
+      propagate uncaught here -- mapping it to a CLI/API-friendly error is
+      separate follow-up work, not this function's job (mirroring how
+      ``Image.open``'s own exceptions already propagate uncaught below).
+    - Otherwise it is loaded normally via ``Image.open`` (from a path, or
+      from an in-memory buffer for raw non-PDF ``bytes``),
+      ``declared_format=None``, ``page_count=1``.
     """
     if isinstance(image, Image.Image):
-        return image
-    return Image.open(image)
+        return _LoadedSample(image=image, declared_format=None, page_count=1)
+
+    if is_pdf(image):
+        rasterization = rasterize_pdf(image)
+        return _LoadedSample(
+            image=rasterization.image,
+            declared_format="PDF",
+            page_count=rasterization.page_count,
+        )
+
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        pil_image = Image.open(io.BytesIO(image))
+    else:
+        pil_image = Image.open(image)
+    return _LoadedSample(image=pil_image, declared_format=None, page_count=1)
 
 
 def _assert_language_is_disciplined(text: str) -> None:
@@ -187,14 +234,23 @@ def run_analysis(
     behavior.
 
     Args:
-        image: A :class:`PIL.Image.Image`, or a path (``str`` or
-            ``os.PathLike``) to an image file. A path is opened once via
-            :class:`PIL.Image.Image.open`; opening can raise (e.g.
-            ``FileNotFoundError`` for a missing path,
-            :class:`PIL.UnidentifiedImageError` for a corrupt/unrecognized
-            file) -- callers that want a friendly, non-traceback error
-            message for that case should catch those (see
-            :mod:`grafology_ai.cli`, which does exactly this).
+        image: A :class:`PIL.Image.Image`, a path (``str`` or
+            ``os.PathLike``) to an image or PDF file, or raw ``bytes``
+            (e.g. an in-memory upload buffer). Path/bytes input is
+            sniffed for the PDF magic header (see
+            :func:`grafology_ai.input.pdf.is_pdf`); if it is a PDF, page 1
+            is rasterized (see :func:`grafology_ai.input.pdf.rasterize_pdf`)
+            and used for the rest of the pipeline, and a
+            ``check_name="pdf_pages"`` ``"flag"`` result is added to
+            :attr:`AnalysisResult.validation_results` when the source PDF
+            has more than one page (see the module docstring). Loading a
+            non-PDF path/bytes or rasterizing a PDF can both raise (e.g.
+            ``FileNotFoundError``/``PIL.UnidentifiedImageError`` for a
+            missing/corrupt image,
+            :class:`grafology_ai.input.pdf.PdfInputError` for a
+            corrupt/unparseable PDF) -- callers that want a friendly,
+            non-traceback error message for that case should catch those
+            (see :mod:`grafology_ai.cli`, which does exactly this).
         depth: Interpretation/report depth, ``"concise"`` or
             ``"indepth"`` (default). Passed straight through to
             :func:`grafology_ai.interpretation.interpret`.
@@ -209,9 +265,26 @@ def run_analysis(
     Returns:
         An :class:`AnalysisResult` bundling every stage's output.
     """
-    pil_image = _load_image(image)
+    loaded = _load_sample(image)
+    pil_image = loaded.image
 
-    validation_results = validate_sample(pil_image, quality_label=quality_label)
+    validation_results = validate_sample(
+        pil_image, quality_label=quality_label, declared_format=loaded.declared_format
+    )
+    if loaded.page_count > 1:
+        validation_results = [
+            *validation_results,
+            ValidationResult(
+                check_name="pdf_pages",
+                verdict="flag",
+                reason=(
+                    f"the source PDF has {loaded.page_count} pages; only page 1 "
+                    "was rasterized and analyzed, the remaining pages were not "
+                    "examined"
+                ),
+                measured_value=float(loaded.page_count),
+            ),
+        ]
     features = analyze(pil_image)
     findings = interpret(features, depth=depth)
 

@@ -36,8 +36,23 @@ Verdict = Literal["accept", "reject", "flag"]
 
 #: Formats this pipeline currently accepts. Handwriting samples supplied as
 #: PDF are common in the client's raw intake but need to be rasterized to
-#: a bitmap format first; see the TODO on :func:`check_format`.
+#: a bitmap format first (see :mod:`grafology_ai.input.pdf`); a rasterized
+#: page is then passed through :func:`check_format` via its
+#: ``declared_format`` parameter rather than added to this tuple, since
+#: the rasterized *page image* is always RGB pixel data, not literally a
+#: PDF file Pillow could detect.
 SUPPORTED_FORMATS: tuple[str, ...] = ("JPEG", "PNG")
+
+#: The explicit, closed set of values :func:`check_format`'s
+#: ``declared_format`` parameter accepts. ``declared_format`` is an
+#: internal/programmatic parameter -- set by a trusted caller (currently
+#: only :func:`grafology_ai.run_analysis.run_analysis`, after it has
+#: itself rasterized a PDF page via :mod:`grafology_ai.input.pdf`), never
+#: derived from untrusted external input -- so a value outside this set
+#: indicates a bug in this codebase, not bad user input, and
+#: :func:`check_format` raises :class:`ValueError` loudly rather than
+#: silently accepting an unrecognized declaration.
+DECLARED_FORMATS: tuple[str, ...] = ("PDF",)
 
 #: Practical proxy for "adequate resolution": real DPI metadata is
 #: frequently missing from phone-camera photos (unlike flatbed scans,
@@ -249,21 +264,45 @@ def check_contrast(
     )
 
 
-def check_format(image: ImageInput) -> ValidationResult:
+def check_format(
+    image: ImageInput,
+    declared_format: str | None = None,
+) -> ValidationResult:
     """Confirm the input is a supported image format (JPEG or PNG).
 
     Format is determined by actually attempting to identify the image
     (via Pillow), not merely by trusting a file extension, so a
     mislabeled or corrupt file is caught rather than waved through.
 
-    TODO (future work, out of scope for this task): the client's raw
-    intake also includes PDF documents. Supporting them will require a
-    conversion step -- rasterizing each page to PNG/JPEG at a chosen DPI,
-    likely via an added dependency such as ``pdf2image`` or ``pypdfium2``
-    -- before any of the checks in this module can run on them. PDFs are
-    not supported yet; this check rejects them like any other unsupported
-    format.
+    Args:
+        image: A :class:`PIL.Image.Image` or a path to an image file.
+        declared_format: When provided and truthy, this format is trusted
+            directly and ``image``/``pil_image.format`` is never
+            re-derived -- this is what lets a rasterized PDF page (a
+            :class:`PIL.Image.Image` with ``.format is None``, since it
+            was never loaded from a file) pass the format check instead
+            of being rejected by the "created in memory" branch below.
+            This is an internal/programmatic parameter set by a trusted
+            caller (see :mod:`grafology_ai.run_analysis`), not derived
+            from external input, so it must be one of
+            :data:`DECLARED_FORMATS` -- anything else raises
+            :class:`ValueError`. Leave as ``None`` (the default) for the
+            normal file-format-detection path; behavior in that case is
+            unchanged from before this parameter existed.
     """
+    if declared_format:
+        if declared_format not in DECLARED_FORMATS:
+            raise ValueError(
+                f"declared_format {declared_format!r} is not one of the "
+                f"accepted values {DECLARED_FORMATS!r}"
+            )
+        return ValidationResult(
+            check_name="format",
+            verdict="accept",
+            reason=f"format declared as {declared_format} (rasterized page image)",
+            measured_value=None,
+        )
+
     try:
         pil_image = image if isinstance(image, Image.Image) else Image.open(image)
         detected_format = pil_image.format
@@ -293,8 +332,9 @@ def check_format(image: ImageInput) -> ValidationResult:
             verdict="reject",
             reason=(
                 f"format {detected_format!r} is not supported; only "
-                f"{', '.join(SUPPORTED_FORMATS)} are supported (PDF "
-                "conversion is a documented future TODO)"
+                f"{', '.join(SUPPORTED_FORMATS)} are supported directly "
+                "(PDF input is supported separately via rasterization; "
+                "see grafology_ai.input.pdf)"
             ),
             measured_value=None,
         )
@@ -310,6 +350,7 @@ def check_format(image: ImageInput) -> ValidationResult:
 def validate_sample(
     image: ImageInput,
     quality_label: str | None = None,
+    declared_format: str | None = None,
 ) -> list[ValidationResult]:
     """Run all automated image-quality checks against a sample.
 
@@ -332,11 +373,14 @@ def validate_sample(
         quality_label: The manifest's declared ``quality`` for this
             sample (``"high"``, ``"medium"``, ``"low"``), or ``None`` if
             unknown/not yet labeled.
+        declared_format: Passed straight through to :func:`check_format`
+            (see its docstring). ``None`` (the default) preserves
+            existing behavior exactly.
     """
     pil_image = _load_image(image)
 
     results = [
-        check_format(image),
+        check_format(image, declared_format=declared_format),
         check_resolution(pil_image),
         check_blur(pil_image),
         check_contrast(pil_image),

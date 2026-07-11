@@ -37,6 +37,7 @@ from grafology_ai.validation import (
     check_resolution,
     validate_sample,
 )
+from grafology_ai.validation.validators import DECLARED_FORMATS
 
 GOOD_SIZE = (800, 600)
 
@@ -252,3 +253,62 @@ def test_validate_sample_format_failure_still_rejects_when_quality_low(
         r.check_name: r for r in validate_sample(path, quality_label="low")
     }
     assert results["format"].verdict == "reject"
+
+
+# --- check_format(declared_format=...) -- B2 --------------------------------------
+
+
+def test_check_format_trusts_declared_format_pdf_for_in_memory_image() -> None:
+    """A rasterized PDF page is a PIL Image with `.format is None` (it was
+    never loaded from a file) -- `declared_format` must accept it without
+    re-deriving `.format` from the original argument."""
+    image = _make_sharp_image()
+    assert image.format is None  # sanity check on the fixture itself
+
+    result = check_format(image, declared_format="PDF")
+    assert result.check_name == "format"
+    assert result.verdict == "accept"
+    assert "PDF" in result.reason
+    assert result.measured_value is None
+
+
+def test_check_format_declared_format_rejects_value_outside_allowed_set() -> None:
+    with pytest.raises(ValueError):
+        check_format(_make_sharp_image(), declared_format="DOCX")
+
+
+def test_declared_formats_constant_is_pdf_only() -> None:
+    assert DECLARED_FORMATS == ("PDF",)
+
+
+def test_check_format_declared_format_none_behaves_exactly_like_omitting_it(
+    tmp_path: Path,
+) -> None:
+    """Backward compatibility: `declared_format=None` (the default) is
+    provably identical to not passing the parameter at all."""
+    path = _save(tmp_path, _make_sharp_image(), "good.png", "PNG")
+
+    omitted = check_format(path)
+    explicit_none = check_format(path, declared_format=None)
+
+    assert omitted == explicit_none
+    assert omitted.verdict == "accept"
+    assert omitted.reason == "format PNG is supported"
+
+
+def test_validate_sample_declared_format_only_short_circuits_format_check(
+    tmp_path: Path,
+) -> None:
+    """`declared_format="PDF"` must only affect the format check --
+    resolution/blur/contrast still run for real on the same pixel data."""
+    path = _save(tmp_path, _make_isolated_blur_bad_image(), "blurry.png", "PNG")
+
+    results = {
+        r.check_name: r for r in validate_sample(path, declared_format="PDF")
+    }
+
+    assert results["format"].verdict == "accept"
+    assert "PDF" in results["format"].reason
+    # Blur was not short-circuited: it still genuinely rejects.
+    assert results["blur"].verdict == "reject"
+    assert results["contrast"].verdict == "accept"
