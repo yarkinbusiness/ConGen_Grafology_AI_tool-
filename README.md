@@ -65,6 +65,7 @@ diverge in behavior.
 ```
 $ grafology-analyze --help
 usage: grafology-analyze [-h] [--depth {concise,indepth}] [--output PATH]
+                         [--format {md,pdf}]
                          [--quality-label {high,medium,low}]
                          [--sample-id TEXT]
                          image
@@ -82,8 +83,14 @@ options:
   -h, --help            show this help message and exit
   --depth {concise,indepth}
                         Interpretation/report depth (default: indepth).
-  --output PATH         Write the markdown report to this file instead of
-                        printing to stdout.
+  --output PATH         Write the report to this file instead of printing to
+                        stdout (printing is only supported for markdown
+                        output). If PATH ends in '.pdf' and --format is not
+                        given explicitly, PDF output is inferred
+                        automatically.
+  --format {md,pdf}     Report output format (default: 'md', unless inferred
+                        as 'pdf' from a '.pdf' --output path). 'pdf' requires
+                        --output.
   --quality-label {high,medium,low}
                         Manifest-declared quality label for this sample, if
                         known. 'low' downgrades blur/contrast rejections to a
@@ -96,6 +103,14 @@ Example invocation, writing a concise report to a file instead of stdout:
 
 ```bash
 grafology-analyze path/to/sample.png --depth concise --sample-id S001 --output report.md
+```
+
+Writing a PDF report instead of markdown -- either works, the `.pdf`
+extension on `--output` is enough to select PDF output (or pass
+`--format pdf` explicitly):
+
+```bash
+grafology-analyze path/to/sample.png --output report.pdf
 ```
 
 A missing or unreadable image/PDF file produces a single clear `stderr`
