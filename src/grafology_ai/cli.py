@@ -14,7 +14,17 @@ Usage::
     grafology-analyze path/to/sample.pdf
     grafology-analyze path/to/sample.png --depth concise
     grafology-analyze path/to/sample.png --output report.md
+    grafology-analyze path/to/sample.png --output report.pdf
+    grafology-analyze path/to/sample.png --format pdf --output report.pdf
     grafology-analyze path/to/sample.png --quality-label low --sample-id S001
+
+By default the report is rendered as markdown (``--format md``). Pass
+``--format pdf`` (which requires ``--output``, since raw PDF bytes cannot
+usefully be printed to a terminal) to render a PDF report instead. As a
+convenience, if ``--output`` is given a path ending in ``.pdf`` and
+``--format`` is *not* explicitly specified, PDF output is inferred
+automatically -- an explicit ``--format`` always wins over this
+inference.
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from typing import Sequence
 from PIL import UnidentifiedImageError
 
 from grafology_ai.input.pdf import PdfInputError
-from grafology_ai.report import save_report
+from grafology_ai.report import save_report, save_report_pdf
 from grafology_ai.run_analysis import run_analysis
 
 
@@ -59,7 +69,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output",
         metavar="PATH",
         default=None,
-        help="Write the markdown report to this file instead of printing to stdout.",
+        help=(
+            "Write the report to this file instead of printing to stdout "
+            "(printing is only supported for markdown output). If PATH "
+            "ends in '.pdf' and --format is not given explicitly, PDF "
+            "output is inferred automatically."
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        choices=("md", "pdf"),
+        default=None,
+        help=(
+            "Report output format (default: 'md', unless inferred as "
+            "'pdf' from a '.pdf' --output path). 'pdf' requires --output."
+        ),
     )
     parser.add_argument(
         "--quality-label",
@@ -93,6 +117,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    # Resolve the effective format: an explicit `--format` always wins;
+    # otherwise infer "pdf" from a `.pdf`-suffixed `--output` path (see
+    # module docstring), falling back to the historical default, "md".
+    if args.format is not None:
+        output_format = args.format
+    elif args.output and args.output.lower().endswith(".pdf"):
+        output_format = "pdf"
+    else:
+        output_format = "md"
+
+    if output_format == "pdf" and not args.output:
+        # Exit code 2 matches argparse's own convention for a usage error
+        # (e.g. a missing required argument), distinguishing this from
+        # exit code 1, used below for pipeline/IO errors encountered
+        # while actually running the analysis.
+        print(
+            "Error: --format pdf requires --output PATH (PDF bytes cannot "
+            "be printed to stdout).",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         result = run_analysis(
             args.image,
@@ -119,11 +165,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.output:
         # `result.findings` already carries any quality-caveat text
-        # `run_analysis` added (see its module docstring), so
-        # `save_report(result.findings, ...)` reproduces `result.report`
-        # exactly (same `findings`, same `sample_id`) -- both branches of
-        # this `if` present identical content, just to different sinks.
-        output_path = save_report(result.findings, args.output, sample_id=args.sample_id)
+        # `run_analysis` added (see its module docstring), so both
+        # `save_report(result.findings, ...)` and
+        # `save_report_pdf(result.findings, ...)` reproduce `result.report`'s
+        # content exactly (same `findings`, same `sample_id`) -- just
+        # rendered to a different format/sink.
+        if output_format == "pdf":
+            output_path = save_report_pdf(result.findings, args.output, sample_id=args.sample_id)
+        else:
+            output_path = save_report(result.findings, args.output, sample_id=args.sample_id)
         print(f"Report written to {output_path}")
     else:
         print(result.report)
