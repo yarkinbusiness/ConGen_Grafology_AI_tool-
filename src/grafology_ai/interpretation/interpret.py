@@ -42,7 +42,7 @@ that stage will format.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from grafology_ai.analysis import Features
 
@@ -141,6 +141,15 @@ class Finding:
     interpretation: str
     confidence: float
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain, JSON-safe ``dict`` of every field, by name."""
+        return {
+            "indicator": self.indicator,
+            "observation": self.observation,
+            "interpretation": self.interpretation,
+            "confidence": self.confidence,
+        }
+
 
 @dataclass(frozen=True)
 class StructuredFindings:
@@ -175,6 +184,22 @@ class StructuredFindings:
     strengths: list[str]
     areas_of_attention: list[str]
     overall_summary: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain, JSON-safe ``dict`` of every field, by name.
+
+        ``depth`` is a ``Literal["concise", "indepth"]``, already a plain
+        ``str`` at runtime. ``findings`` is converted to a list of plain
+        dicts via :meth:`Finding.to_dict`, not left as a list of
+        :class:`Finding` instances.
+        """
+        return {
+            "depth": self.depth,
+            "findings": [finding.to_dict() for finding in self.findings],
+            "strengths": list(self.strengths),
+            "areas_of_attention": list(self.areas_of_attention),
+            "overall_summary": self.overall_summary,
+        }
 
 
 # --- indicator identity: names, labels, and Features confidence mapping -----

@@ -71,7 +71,7 @@ import dataclasses
 import io
 import os
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, Union
 
 from PIL import Image
 
@@ -218,6 +218,33 @@ class AnalysisResult:
     def has_rejected_validation(self) -> bool:
         """Whether any automated image-quality check rejected this sample."""
         return len(self.rejected_validation_checks) > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain, JSON-safe ``dict`` of every field, by name.
+
+        This is the single source of truth every JSON-emitting layer
+        (e.g. a future :mod:`grafology_ai.api` response body) should
+        serialize from, rather than hand-building a dict field-by-field.
+        Nested dataclasses are recursively converted via their own
+        ``to_dict()`` methods, never left as dataclass instances:
+        ``validation_results`` becomes a list of
+        :class:`~grafology_ai.validation.ValidationResult` dicts,
+        ``features`` becomes a
+        :meth:`~grafology_ai.analysis.Features.to_dict` dict, and
+        ``findings`` becomes a
+        :meth:`~grafology_ai.interpretation.StructuredFindings.to_dict`
+        dict (itself containing a ``findings`` list of plain ``Finding``
+        dicts). Only the four dataclass fields are included here -- the
+        ``rejected_validation_checks``/``has_rejected_validation``
+        convenience properties are derived, not stored data, so callers
+        that want them can recompute them from ``validation_results``.
+        """
+        return {
+            "validation_results": [result.to_dict() for result in self.validation_results],
+            "features": self.features.to_dict(),
+            "findings": self.findings.to_dict(),
+            "report": self.report,
+        }
 
 
 def run_analysis(

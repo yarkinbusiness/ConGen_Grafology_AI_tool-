@@ -44,7 +44,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, Union
 
 import numpy as np
 from PIL import Image
@@ -367,6 +367,40 @@ class Features:
     stroke_connectedness: float
     organization_score: float
     confidence: dict[str, float]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain, JSON-safe ``dict`` of every field, by name.
+
+        Every field here is already a JSON-safe scalar or a ``dict[str,
+        float]`` (:attr:`confidence`), so this is a flat conversion --
+        ``confidence`` is copied into a new plain ``dict`` rather than
+        referencing the original (see the module-level serialization
+        contract in :mod:`grafology_ai.run_analysis`, whose
+        :meth:`~grafology_ai.run_analysis.AnalysisResult.to_dict` composes
+        this method for the nested ``features`` entry). Kept as an
+        explicit field-by-field mapping (rather than
+        ``dataclasses.asdict``) so a future field addition is caught by
+        the completeness check in ``tests/test_serialization.py`` instead
+        of silently round-tripping through a generic recursive helper.
+        """
+        return {
+            "slant_angle_degrees": self.slant_angle_degrees,
+            "stroke_width_mean": self.stroke_width_mean,
+            "stroke_width_std": self.stroke_width_std,
+            "letter_size_estimate": self.letter_size_estimate,
+            "line_spacing_mean": self.line_spacing_mean,
+            "word_spacing_mean": self.word_spacing_mean,
+            "baseline_slope_degrees": self.baseline_slope_degrees,
+            "margin_left_px": self.margin_left_px,
+            "margin_right_px": self.margin_right_px,
+            "margin_top_px": self.margin_top_px,
+            "margin_bottom_px": self.margin_bottom_px,
+            "ink_density": self.ink_density,
+            "rhythm_regularity": self.rhythm_regularity,
+            "stroke_connectedness": self.stroke_connectedness,
+            "organization_score": self.organization_score,
+            "confidence": dict(self.confidence),
+        }
 
 
 #: The subset of :class:`Features` fields the `confidence` dict must cover

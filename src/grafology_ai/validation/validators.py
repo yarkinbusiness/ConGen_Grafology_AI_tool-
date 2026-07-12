@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Literal, Union
+from typing import Any, Literal, Union
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
@@ -113,6 +113,19 @@ class ValidationResult:
     verdict: Verdict
     reason: str
     measured_value: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain, JSON-safe ``dict`` of every field, by name.
+
+        ``verdict`` is a ``Literal["accept", "reject", "flag"]``, already
+        a plain ``str`` at runtime.
+        """
+        return {
+            "check_name": self.check_name,
+            "verdict": self.verdict,
+            "reason": self.reason,
+            "measured_value": self.measured_value,
+        }
 
 
 def _load_image(image: ImageInput) -> Image.Image:
