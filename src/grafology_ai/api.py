@@ -21,12 +21,12 @@ an ASGI server such as ``uvicorn``.
 
 from __future__ import annotations
 
-import io
 from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from PIL import Image, UnidentifiedImageError
+from PIL import UnidentifiedImageError
 
+from grafology_ai.input.pdf import PdfInputError
 from grafology_ai.run_analysis import run_analysis
 
 app = FastAPI(
@@ -41,18 +41,24 @@ app = FastAPI(
 
 @app.post("/analyze")
 async def analyze_endpoint(
-    image: UploadFile = File(..., description="Handwriting-sample image file (JPEG or PNG)."),
+    image: UploadFile = File(
+        ..., description="Handwriting-sample file (JPEG, PNG, or PDF)."
+    ),
     depth: Literal["concise", "indepth"] = Form("indepth"),
     quality_label: str | None = Form(None),
     sample_id: str | None = Form(None),
 ) -> dict[str, Any]:
-    """Run :func:`run_analysis` on an uploaded image and return a JSON summary.
+    """Run :func:`run_analysis` on an uploaded file and return a JSON summary.
 
-    Request: ``multipart/form-data`` with an ``image`` file field plus
-    optional ``depth`` (``"concise"``/``"indepth"``, default
-    ``"indepth"``), ``quality_label`` (``"high"``/``"medium"``/``"low"``),
-    and ``sample_id`` form fields -- the same parameters
-    :func:`~grafology_ai.run_analysis.run_analysis` takes.
+    Request: ``multipart/form-data`` with an ``image`` file field (an
+    image or a PDF -- see :func:`grafology_ai.input.pdf.is_pdf`, which
+    :func:`~grafology_ai.run_analysis.run_analysis` uses internally to
+    detect and rasterize PDF uploads; for a PDF, only the first page is
+    analyzed) plus optional ``depth`` (``"concise"``/``"indepth"``,
+    default ``"indepth"``), ``quality_label``
+    (``"high"``/``"medium"``/``"low"``), and ``sample_id`` form fields --
+    the same parameters :func:`~grafology_ai.run_analysis.run_analysis`
+    takes.
 
     Response body (200 on success)::
 
@@ -70,30 +76,33 @@ async def analyze_endpoint(
         }
 
     A file that cannot be opened/identified as an image (corrupt data,
-    unsupported format) yields ``400 Bad Request`` with a descriptive
+    unsupported format) or a PDF that cannot be rasterized (corrupt,
+    encrypted, zero-page) yields ``400 Bad Request`` with a descriptive
     ``detail`` message rather than a raw traceback / 500.
     """
     raw_bytes = await image.read()
     try:
-        pil_image = Image.open(io.BytesIO(raw_bytes))
-        pil_image.load()
+        result = run_analysis(
+            raw_bytes,
+            depth=depth,
+            quality_label=quality_label,
+            sample_id=sample_id,
+        )
     except UnidentifiedImageError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Could not identify '{image.filename}' as a supported image file: {exc}",
+        ) from exc
+    except PdfInputError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read '{image.filename}' as a valid PDF file: {exc}",
         ) from exc
     except OSError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Could not open uploaded file '{image.filename}': {exc}",
         ) from exc
-
-    result = run_analysis(
-        pil_image,
-        depth=depth,
-        quality_label=quality_label,
-        sample_id=sample_id,
-    )
 
     return {
         "sample_id": sample_id,

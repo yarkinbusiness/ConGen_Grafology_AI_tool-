@@ -64,6 +64,40 @@ def _write_sample(tmp_path: Path, name: str = "sample.png") -> Path:
     return path
 
 
+# --- PDF input helpers (Phase B3) -----------------------------------------------
+#
+# Built the same way as ``tests/test_pdf_input.py`` / ``tests/test_run_analysis.py``:
+# Pillow's own ``Image.save(..., format="PDF")``, no extra PDF-generation
+# dependency and no checked-in binary fixture.
+
+
+def _pdf_bytes_from_images(images: list[Image.Image]) -> bytes:
+    """Save `images` as a (possibly multi-page) in-memory PDF and return its bytes."""
+    buffer = io.BytesIO()
+    images[0].save(buffer, format="PDF", save_all=True, append_images=images[1:])
+    return buffer.getvalue()
+
+
+def _clean_pdf_bytes() -> bytes:
+    """A single-page PDF that should pass every automated quality check."""
+    return _pdf_bytes_from_images([_draw_stroke_grid((800, 1000))])
+
+
+def _multi_page_pdf_bytes() -> bytes:
+    pages = [
+        _draw_stroke_grid((800, 1000)),
+        _draw_stroke_grid((800, 1000), slant_deg=-10.0),
+        _draw_stroke_grid((800, 1000), slant_deg=20.0),
+    ]
+    return _pdf_bytes_from_images(pages)
+
+
+# A corrupt PDF: starts with the real ``%PDF-`` magic header (so `is_pdf`
+# would say True) but is not a parseable PDF document beyond that -- the
+# same construction ``tests/test_pdf_input.py`` uses.
+_CORRUPT_PDF_BYTES = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\nthis is not really a pdf body at all"
+
+
 # --- happy path -------------------------------------------------------------------
 
 
@@ -148,6 +182,58 @@ def test_analyze_endpoint_rejects_unopenable_file() -> None:
 
     assert response.status_code == 400
     assert "detail" in response.json()
+
+
+# --- PDF input (Phase B3) --------------------------------------------------------
+
+
+def test_analyze_endpoint_accepts_clean_pdf_upload() -> None:
+    image_response = client.post(
+        "/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+    )
+    pdf_response = client.post(
+        "/analyze",
+        files={"image": ("sample.pdf", _clean_pdf_bytes(), "application/pdf")},
+        data={"sample_id": "pdf-api-001"},
+    )
+
+    assert pdf_response.status_code == 200
+    pdf_body = pdf_response.json()
+    assert set(pdf_body) == set(image_response.json())
+    assert pdf_body["sample_id"] == "pdf-api-001"
+    assert "# Handwriting Analysis Support Report" in pdf_body["report_markdown"]
+    assert isinstance(pdf_body["validation_results"], list) and pdf_body["validation_results"]
+    for entry in pdf_body["validation_results"]:
+        assert set(entry) == {"check_name", "verdict", "reason", "measured_value"}
+
+
+def test_analyze_endpoint_rejects_corrupt_pdf_upload() -> None:
+    response = client.post(
+        "/analyze",
+        files={"image": ("corrupt.pdf", _CORRUPT_PDF_BYTES, "application/pdf")},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "detail" in body
+    assert isinstance(body["detail"], str) and body["detail"]
+
+
+def test_analyze_endpoint_multi_page_pdf_upload_flags_pdf_pages() -> None:
+    response = client.post(
+        "/analyze",
+        files={"image": ("multi.pdf", _multi_page_pdf_bytes(), "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    pdf_page_entries = [
+        entry for entry in body["validation_results"] if entry["check_name"] == "pdf_pages"
+    ]
+    assert len(pdf_page_entries) == 1
+    assert pdf_page_entries[0]["verdict"] == "flag"
+    assert pdf_page_entries[0]["measured_value"] == 3
 
 
 # --- CLI/API consistency: same input -> same underlying analysis ----------------

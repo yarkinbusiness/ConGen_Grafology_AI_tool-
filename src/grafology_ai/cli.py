@@ -11,6 +11,7 @@ duplicate any pipeline logic, it only parses arguments, calls
 Usage::
 
     grafology-analyze path/to/sample.png
+    grafology-analyze path/to/sample.pdf
     grafology-analyze path/to/sample.png --depth concise
     grafology-analyze path/to/sample.png --output report.md
     grafology-analyze path/to/sample.png --quality-label low --sample-id S001
@@ -24,6 +25,7 @@ from typing import Sequence
 
 from PIL import UnidentifiedImageError
 
+from grafology_ai.input.pdf import PdfInputError
 from grafology_ai.report import save_report
 from grafology_ai.run_analysis import run_analysis
 
@@ -35,13 +37,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Run the full handwriting-sample analysis pipeline (automated "
             "image-quality validation, classical feature analysis, "
             "interpretation, and markdown report generation) on a single "
-            "image, end to end. This is a support tool for professional "
-            "graphologists, not a diagnostic tool."
+            "handwriting sample (image or PDF), end to end. This is a "
+            "support tool for professional graphologists, not a "
+            "diagnostic tool."
         ),
     )
     parser.add_argument(
         "image",
-        help="Path to the handwriting-sample image file (JPEG or PNG).",
+        help=(
+            "Path to the handwriting-sample file (JPEG, PNG, or PDF). "
+            "For a PDF, only the first page is analyzed."
+        ),
     )
     parser.add_argument(
         "--depth",
@@ -81,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``sys.exit`` itself, so it can be invoked directly and asserted on in
     tests without a ``SystemExit`` needing to be caught.
 
-    A missing or unopenable image file produces a single, clear
+    A missing or unopenable image/PDF file produces a single, clear
     ``stderr`` message and a non-zero exit code -- never a raw traceback.
     """
     parser = _build_parser()
@@ -106,6 +112,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except OSError as exc:
         print(f"Error: could not open image file '{args.image}': {exc}", file=sys.stderr)
+        return 1
+    except PdfInputError as exc:
+        print(f"Error: could not read PDF file '{args.image}': {exc}", file=sys.stderr)
         return 1
 
     if args.output:

@@ -57,6 +57,31 @@ def _write_sample(tmp_path: Path, name: str = "sample.png") -> Path:
     return path
 
 
+# --- PDF input helpers (Phase B3) -----------------------------------------------
+#
+# Built the same way as ``tests/test_pdf_input.py`` / ``tests/test_run_analysis.py``:
+# Pillow's own ``Image.save(..., format="PDF")``, no extra PDF-generation
+# dependency and no checked-in binary fixture.
+
+
+def _write_pdf_sample(tmp_path: Path, name: str = "sample.pdf") -> Path:
+    path = tmp_path / name
+    _draw_stroke_grid((800, 1000)).save(path, format="PDF")
+    return path
+
+
+# A corrupt PDF: starts with the real ``%PDF-`` magic header (so `is_pdf`
+# would say True) but is not a parseable PDF document beyond that -- the
+# same construction ``tests/test_pdf_input.py`` uses.
+_CORRUPT_PDF_BYTES = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\nthis is not really a pdf body at all"
+
+
+def _write_corrupt_pdf(tmp_path: Path, name: str = "corrupt.pdf") -> Path:
+    path = tmp_path / name
+    path.write_bytes(_CORRUPT_PDF_BYTES)
+    return path
+
+
 # --- in-process: main() with an explicit argv, stdout path ---------------------
 
 
@@ -139,6 +164,49 @@ def test_cli_unopenable_file_gives_clear_error_and_nonzero_exit(tmp_path: Path) 
     exit_code = main([str(bad_path)])
 
     assert exit_code != 0
+
+
+# --- PDF input (Phase B3) --------------------------------------------------------
+
+
+def test_cli_clean_pdf_prints_report_to_stdout(tmp_path: Path, capsys) -> None:
+    pdf_path = _write_pdf_sample(tmp_path)
+
+    exit_code = main([str(pdf_path), "--depth", "indepth", "--sample-id", "pdf-cli-001"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "# Handwriting Analysis Support Report" in captured.out
+    assert "pdf-cli-001" in captured.out
+
+    direct = run_analysis(pdf_path, depth="indepth", sample_id="pdf-cli-001")
+    assert direct.findings.overall_summary in captured.out
+
+
+def test_cli_corrupt_pdf_gives_clear_error_and_nonzero_exit(tmp_path: Path, capsys) -> None:
+    corrupt_pdf_path = _write_corrupt_pdf(tmp_path)
+
+    exit_code = main([str(corrupt_pdf_path)])
+
+    assert exit_code != 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    stderr_lines = [line for line in captured.err.splitlines() if line.strip()]
+    assert len(stderr_lines) == 1
+    assert "Error" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_help_mentions_pdf_support() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "grafology_ai.cli", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0
+    assert "PDF" in completed.stdout
+    assert "JPEG or PNG" not in completed.stdout
 
 
 # --- out-of-process: exercises the actual `python -m grafology_ai.cli` entry ----
