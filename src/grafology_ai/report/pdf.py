@@ -297,9 +297,12 @@ def _render_closing_note(pdf: _ReportPDF) -> None:
     y = pdf.get_y()
     pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
     pdf.ln(_PARAGRAPH_GAP_MM)
-    # `_CLOSING_NOTE_TEXT` is this module's own boilerplate and contains
-    # fpdf2 `**bold**`/single-`*` markup -- see `_render_disclaimer`.
-    _write_body(pdf, _CLOSING_NOTE_TEXT, markdown=True)
+    # `_CLOSING_NOTE_TEXT` is wrapped in a single leading/trailing `*` for
+    # markdown italics, a marker fpdf2's `markdown=True` mode does not
+    # recognize (its italics marker is `__`, not `*`) -- rendered as-is it
+    # would leave literal asterisk characters in the PDF. It contains no
+    # other markup, so strip that wrapper and write it as plain text.
+    _write_body(pdf, _CLOSING_NOTE_TEXT.strip("*"))
 
 
 # --- public entry points --------------------------------------------------------
