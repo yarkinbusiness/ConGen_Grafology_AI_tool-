@@ -36,14 +36,15 @@ leaking into the text) for both ``depth="concise"`` and ``depth="indepth"``
 findings, and for the near-blank/low-confidence case where ``strengths``
 and/or ``areas_of_attention`` are empty.
 
-:func:`save_report` writes the same markdown to disk. Markdown-to-PDF
-conversion is explicitly out of scope for this stage: the client's
-technical proposal only calls for markdown/text output here, and adding a
-PDF renderer would mean a new runtime dependency this task does not need.
-It remains a documented future step -- a later stage can take the
-markdown this module produces and render it to PDF (e.g. via a
-lightweight markdown-to-PDF tool) without needing to change anything in
-this module.
+:func:`save_report` writes the same markdown to disk. PDF output is
+handled by a sibling module, `grafology_ai.report.pdf`
+(:func:`~grafology_ai.report.pdf.render_report_pdf` /
+:func:`~grafology_ai.report.pdf.save_report_pdf`), which renders the same
+fixed sections directly from a `StructuredFindings` -- not from the
+markdown string this module produces -- so the two outputs can never
+structurally diverge from one another, both always being derived
+straight from the same structured data. Nothing in this module needed to
+change to support that.
 """
 
 from __future__ import annotations
@@ -270,9 +271,9 @@ def save_report(
     exist. Returns `output_path` (as a `Path`, even if a string-like was
     passed in) for convenient chaining.
 
-    Markdown-to-PDF conversion is out of scope here -- see the module
-    docstring's "Report shape" section -- this only ever writes the
-    markdown text itself.
+    PDF output is out of scope here -- see the module docstring -- this
+    only ever writes the markdown text itself; for PDF, see
+    `grafology_ai.report.pdf.save_report_pdf`.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
