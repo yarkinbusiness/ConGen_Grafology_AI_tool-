@@ -20,6 +20,8 @@ from PIL import Image, ImageDraw
 
 from grafology_ai.api import app
 from grafology_ai.cli import main as cli_main
+from grafology_ai.interpretation import INDICATOR_LABELS, INDICATOR_ORDER
+from grafology_ai.report.generator import confidence_label
 from grafology_ai.run_analysis import run_analysis
 
 BACKGROUND = 255
@@ -262,3 +264,231 @@ def test_cli_and_api_produce_consistent_results_for_same_input(tmp_path: Path, c
     assert direct.findings.overall_summary in api_body["report_markdown"]
     assert direct.findings.overall_summary == api_body["overall_summary"]
     assert api_body["depth"] == direct.findings.depth == "indepth"
+
+
+# --- Phase D2: typed /v1/analyze response, backward-compatible /analyze alias ----
+
+
+_EXPECTED_ANALYZE_RESPONSE_KEYS = {
+    "sample_id",
+    "depth",
+    "report_markdown",
+    "overall_summary",
+    "has_rejected_validation",
+    "validation_results",
+    "features",
+    "findings",
+    "strengths",
+    "areas_of_attention",
+}
+
+
+def _assert_body_matches_direct_result(body: dict, direct, sample_id: str | None) -> None:
+    """Assert an /v1/analyze (or /analyze) response `body` matches a direct
+    `run_analysis()` call's `AnalysisResult` (`direct`), field by field."""
+    assert set(body) == _EXPECTED_ANALYZE_RESPONSE_KEYS
+
+    assert body["sample_id"] == sample_id
+    assert body["depth"] == direct.findings.depth
+    assert body["report_markdown"] == direct.report
+    assert body["overall_summary"] == direct.findings.overall_summary
+    assert body["has_rejected_validation"] == direct.has_rejected_validation
+
+    assert body["validation_results"] == [vr.to_dict() for vr in direct.validation_results]
+
+    assert body["features"] == direct.features.to_dict()
+
+    assert len(body["findings"]) == len(direct.findings.findings)
+    for entry, finding in zip(body["findings"], direct.findings.findings):
+        assert entry["indicator"] == finding.indicator
+        assert entry["label"] == INDICATOR_LABELS[finding.indicator]
+        assert entry["observation"] == finding.observation
+        assert entry["interpretation"] == finding.interpretation
+        assert entry["confidence"] == finding.confidence
+        assert entry["confidence_label"] == confidence_label(finding.confidence)
+
+    assert body["strengths"] == list(direct.findings.strengths)
+    assert body["areas_of_attention"] == list(direct.findings.areas_of_attention)
+
+
+def test_v1_analyze_returns_200_with_full_shape_matching_direct_run_analysis() -> None:
+    image_bytes = _sample_png_bytes()
+
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", image_bytes, "image/png")},
+        data={"depth": "indepth", "sample_id": "v1-001"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    direct = run_analysis(image_bytes, depth="indepth", sample_id="v1-001")
+    _assert_body_matches_direct_result(body, direct, sample_id="v1-001")
+
+
+def test_analyze_alias_returns_full_expanded_shape_superset_of_legacy_keys() -> None:
+    """`/analyze` (the legacy path) now returns the same full D2 shape as
+    `/v1/analyze`, which is a strict superset of the original pre-D2 keys
+    every pre-existing test above already exercises unmodified."""
+    image_bytes = _sample_png_bytes()
+
+    response = client.post(
+        "/analyze",
+        files={"image": ("sample.png", image_bytes, "image/png")},
+        data={"depth": "indepth", "sample_id": "legacy-001"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    legacy_keys = {
+        "sample_id",
+        "depth",
+        "report_markdown",
+        "overall_summary",
+        "has_rejected_validation",
+        "validation_results",
+    }
+    assert legacy_keys.issubset(set(body))
+
+    direct = run_analysis(image_bytes, depth="indepth", sample_id="legacy-001")
+    _assert_body_matches_direct_result(body, direct, sample_id="legacy-001")
+
+
+def test_openapi_schema_has_named_component_schemas_for_response_models() -> None:
+    schema = client.get("/openapi.json").json()
+    component_names = set(schema["components"]["schemas"])
+
+    assert "AnalyzeResponse" in component_names
+    assert "FeaturesModel" in component_names
+    assert "FindingModel" in component_names
+    assert "ValidationResultModel" in component_names
+
+    # And the schema is actually used (not just declared) by /v1/analyze's
+    # 200 response -- not merely a generic `object`/`dict[str, Any]`.
+    analyze_response_schema = schema["paths"]["/v1/analyze"]["post"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
+    assert "AnalyzeResponse" in analyze_response_schema.get("$ref", "")
+
+
+def test_v1_analyze_invalid_depth_returns_structured_422() -> None:
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"depth": "bogus"},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert isinstance(body.get("detail"), list)
+    assert body["detail"]
+
+
+def test_v1_analyze_invalid_quality_label_returns_structured_422() -> None:
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"quality_label": "bogus"},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert isinstance(body.get("detail"), list)
+    assert body["detail"]
+
+
+def test_v1_analyze_valid_quality_label_values_still_accepted() -> None:
+    for label in ("high", "medium", "low"):
+        response = client.post(
+            "/v1/analyze",
+            files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+            data={"quality_label": label},
+        )
+        assert response.status_code == 200, label
+
+
+def test_v1_analyze_confidence_label_agrees_with_generator_thresholds() -> None:
+    """Exercises at least two different confidence buckets and confirms each
+    finding's `confidence_label` agrees with `report/generator.py`'s actual
+    thresholds applied to that same finding's numeric `confidence`."""
+    # A clean, high-signal sample plus a near-blank one give a spread of
+    # confidence values (and therefore confidence_label buckets) across
+    # their combined findings.
+    grid_response = client.post(
+        "/v1/analyze",
+        files={"image": ("grid.png", _sample_png_bytes(), "image/png")},
+        data={"depth": "indepth"},
+    )
+    blank_buffer = io.BytesIO()
+    Image.new("L", (600, 600), color=255).convert("RGB").save(blank_buffer, format="PNG")
+    blank_response = client.post(
+        "/v1/analyze",
+        files={"image": ("blank.png", blank_buffer.getvalue(), "image/png")},
+        data={"depth": "indepth"},
+    )
+
+    assert grid_response.status_code == 200
+    assert blank_response.status_code == 200
+
+    all_findings = grid_response.json()["findings"] + blank_response.json()["findings"]
+    labels_seen = set()
+    for entry in all_findings:
+        expected_label = confidence_label(entry["confidence"])
+        assert entry["confidence_label"] == expected_label
+        labels_seen.add(entry["confidence_label"])
+
+    assert len(labels_seen) >= 2
+
+
+def test_v1_analyze_concise_and_indepth_depths_both_work() -> None:
+    concise_response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"depth": "concise"},
+    )
+    indepth_response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"depth": "indepth"},
+    )
+
+    assert concise_response.status_code == 200
+    assert indepth_response.status_code == 200
+
+    concise_body = concise_response.json()
+    indepth_body = indepth_response.json()
+
+    assert concise_body["depth"] == "concise"
+    assert indepth_body["depth"] == "indepth"
+
+    assert len(indepth_body["findings"]) == len(INDICATOR_ORDER)
+    assert len(concise_body["findings"]) < len(indepth_body["findings"])
+    assert len(concise_body["findings"]) == 4
+
+
+def test_v1_analyze_pdf_upload_returns_same_full_response_shape() -> None:
+    image_response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+    )
+    pdf_response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.pdf", _clean_pdf_bytes(), "application/pdf")},
+        data={"sample_id": "pdf-v1-001"},
+    )
+
+    assert pdf_response.status_code == 200
+    pdf_body = pdf_response.json()
+    assert set(pdf_body) == set(image_response.json()) == _EXPECTED_ANALYZE_RESPONSE_KEYS
+    assert pdf_body["sample_id"] == "pdf-v1-001"
+    assert isinstance(pdf_body["features"], dict)
+    assert isinstance(pdf_body["findings"], list) and pdf_body["findings"]
+
+
+def test_v1_analyze_rejects_unopenable_file_with_400_and_detail() -> None:
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("not_an_image.png", b"this is not image data", "image/png")},
+    )
+    assert response.status_code == 400
+    body = response.json()
+    assert "detail" in body
+    assert isinstance(body["detail"], str) and body["detail"]
