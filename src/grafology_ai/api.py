@@ -30,6 +30,26 @@ D2 (``sample_id``, ``depth``, ``report_markdown``, ``overall_summary``,
 with the same meaning, plus the newly exposed ``features``, ``findings``,
 ``strengths``, and ``areas_of_attention``.
 
+PDF report delivery (Phase D3)
+-------------------------------
+
+An ``output_format`` form field (``"json"`` default | ``"pdf"``) lets a
+caller ask for the same analyzed result rendered as a PDF report (via
+:func:`grafology_ai.report.pdf.render_report_pdf`) instead of the JSON
+:class:`~grafology_ai.api_models.AnalyzeResponse` body -- e.g. a
+``multipart/form-data`` ``application/pdf`` response with a
+``Content-Disposition: attachment`` header, suitable for a browser to
+download directly. This only changes how a *successfully analyzed*
+result is returned; upload/read errors (``400``) and parameter validation
+(``422``, including an invalid ``output_format`` itself) are unaffected.
+Because the endpoint can now return either a Pydantic model or a raw
+:class:`fastapi.responses.Response`, its return type annotation is a
+``Union`` of both -- FastAPI passes a returned ``Response`` straight
+through untouched (bypassing ``response_model`` serialization) while
+still validating/serializing a returned :class:`AnalyzeResponse` against
+the declared ``response_model``, so the ``"json"`` path's OpenAPI schema
+and runtime behavior are completely unchanged from D2.
+
 Running a live server is explicitly out of scope here (only the ``app``
 object matters for "proving web-readiness"); tests exercise this module
 via FastAPI's ``TestClient`` (``fastapi.testclient``), never a running
@@ -40,9 +60,11 @@ such as ``uvicorn``.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 from PIL import UnidentifiedImageError
 
 from grafology_ai.api_models import (
@@ -54,6 +76,7 @@ from grafology_ai.api_models import (
 from grafology_ai.input.pdf import PdfInputError
 from grafology_ai.interpretation import INDICATOR_LABELS
 from grafology_ai.report.generator import confidence_label
+from grafology_ai.report.pdf import render_report_pdf
 from grafology_ai.run_analysis import AnalysisResult, run_analysis
 
 app = FastAPI(
@@ -110,6 +133,34 @@ def _build_response(
     )
 
 
+#: Characters kept as-is in a `Content-Disposition` filename derived from a
+#: caller-supplied `sample_id`; everything else collapses to `"_"`. `sample_id`
+#: is free text (see `api_models`/`run_analysis`), so it may contain quotes,
+#: path separators, control characters, or other bytes that are unsafe or
+#: ambiguous inside an HTTP header value -- this is a simple allow-list, not
+#: an attempt at exhaustive RFC 6266 correctness, which is more than this
+#: internal support tool's filename needs (see `_pdf_filename`'s docstring).
+_SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _pdf_filename(sample_id: str | None) -> str:
+    """Build a safe-ish `report-{name}.pdf` filename for the PDF `output_format`.
+
+    `name` is `sample_id` with any character outside a small allow-list
+    (letters, digits, `.`, `_`, `-`) collapsed to `"_"`, so a `sample_id`
+    containing a `"`, a path separator, or other header-unsafe characters
+    can never break out of the `Content-Disposition` header value or be
+    interpreted as a path by a naive client. Falls back to the literal
+    `"sample"` when `sample_id` is absent/blank or sanitizes down to
+    nothing. This is deliberately simple allow-list sanitization, not a
+    full RFC 6266 `filename*`/percent-encoding implementation -- adequate
+    for a support tool's downloaded-report filename, not a hardened
+    multi-tenant file-serving path.
+    """
+    name = _SAFE_FILENAME_CHARS.sub("_", sample_id).strip("_") if sample_id else ""
+    return f"report-{name or 'sample'}.pdf"
+
+
 @app.post("/v1/analyze", response_model=AnalyzeResponse)
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_endpoint(
@@ -119,8 +170,9 @@ async def analyze_endpoint(
     depth: Literal["concise", "indepth"] = Form("indepth"),
     quality_label: Literal["high", "medium", "low"] | None = Form(None),
     sample_id: str | None = Form(None),
-) -> AnalyzeResponse:
-    """Run :func:`run_analysis` on an uploaded file and return a typed JSON summary.
+    output_format: Literal["json", "pdf"] = Form("json"),
+) -> AnalyzeResponse | Response:
+    """Run :func:`run_analysis` on an uploaded file and return the result.
 
     Mounted at both ``POST /v1/analyze`` (the primary, versioned route)
     and ``POST /analyze`` (a backward-compatible alias -- both paths are
@@ -132,23 +184,34 @@ async def analyze_endpoint(
     detect and rasterize PDF uploads; for a PDF, only the first page is
     analyzed) plus optional ``depth`` (``"concise"``/``"indepth"``,
     default ``"indepth"``), ``quality_label``
-    (``"high"``/``"medium"``/``"low"``), and ``sample_id`` form fields --
-    the same parameters :func:`~grafology_ai.run_analysis.run_analysis`
-    takes. An invalid ``depth`` or ``quality_label`` value (anything
-    outside those literal sets) yields FastAPI's standard structured
-    ``422`` validation-error response, not a hand-rolled error.
+    (``"high"``/``"medium"``/``"low"``), ``sample_id``, and
+    ``output_format`` (``"json"``/``"pdf"``, default ``"json"``) form
+    fields -- the same parameters :func:`~grafology_ai.run_analysis.run_analysis`
+    takes, plus ``output_format`` selecting how the *successfully analyzed*
+    result is returned (see below). An invalid ``depth``, ``quality_label``,
+    or ``output_format`` value (anything outside those literal sets) yields
+    FastAPI's standard structured ``422`` validation-error response, not a
+    hand-rolled error.
 
-    Response body (200 on success): see
-    :class:`grafology_ai.api_models.AnalyzeResponse` for the full typed
-    shape (``sample_id``, ``depth``, ``report_markdown``,
-    ``overall_summary``, ``has_rejected_validation``,
-    ``validation_results``, ``features``, ``findings``, ``strengths``,
-    ``areas_of_attention``).
+    Response body (200 on success) depends on ``output_format``:
 
-    A file that cannot be opened/identified as an image (corrupt data,
-    unsupported format) or a PDF that cannot be rasterized (corrupt,
-    encrypted, zero-page) yields ``400 Bad Request`` with a descriptive
-    ``detail`` message rather than a raw traceback / 500.
+    - ``"json"`` (the default -- unchanged from before Phase D3): a JSON
+      :class:`grafology_ai.api_models.AnalyzeResponse` body (``sample_id``,
+      ``depth``, ``report_markdown``, ``overall_summary``,
+      ``has_rejected_validation``, ``validation_results``, ``features``,
+      ``findings``, ``strengths``, ``areas_of_attention``).
+    - ``"pdf"``: an ``application/pdf`` body -- the same analysis result
+      rendered via :func:`grafology_ai.report.pdf.render_report_pdf`
+      instead -- with a ``Content-Disposition: attachment;
+      filename="report-{name}.pdf"`` header (``{name}`` derived from
+      ``sample_id`` if given, else ``"sample"``; see :func:`_pdf_filename`).
+
+    Format only affects how a *successful* analysis is returned; it has no
+    effect on upload/read errors below. A file that cannot be
+    opened/identified as an image (corrupt data, unsupported format) or a
+    PDF that cannot be rasterized (corrupt, encrypted, zero-page) yields
+    ``400 Bad Request`` with a descriptive ``detail`` message rather than a
+    raw traceback / 500, for either ``output_format``.
     """
     raw_bytes = await image.read()
     try:
@@ -173,5 +236,15 @@ async def analyze_endpoint(
             status_code=400,
             detail=f"Could not open uploaded file '{image.filename}': {exc}",
         ) from exc
+
+    if output_format == "pdf":
+        pdf_bytes = render_report_pdf(result.findings, sample_id=sample_id)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{_pdf_filename(sample_id)}"'
+            },
+        )
 
     return _build_response(result, sample_id=sample_id)

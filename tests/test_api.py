@@ -15,6 +15,7 @@ import io
 import math
 from pathlib import Path
 
+import pypdfium2 as pdfium
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
@@ -23,6 +24,8 @@ from grafology_ai.cli import main as cli_main
 from grafology_ai.interpretation import INDICATOR_LABELS, INDICATOR_ORDER
 from grafology_ai.report.generator import confidence_label
 from grafology_ai.run_analysis import run_analysis
+
+DISCLAIMER_CORE_PHRASE = "not a diagnosis"
 
 BACKGROUND = 255
 INK = 0
@@ -492,3 +495,123 @@ def test_v1_analyze_rejects_unopenable_file_with_400_and_detail() -> None:
     body = response.json()
     assert "detail" in body
     assert isinstance(body["detail"], str) and body["detail"]
+
+
+# --- Phase D3: output_format=pdf -------------------------------------------------
+#
+# `_extract_pdf_text` mirrors `tests/test_report_pdf.py`'s helper of the same
+# name (see that file's docstring for why: `pypdfium2`-extracted text
+# separates fpdf2's word-wrapped lines with line breaks rather than the
+# single space that originally separated those words, so whitespace is
+# collapsed to recover the original word sequence for substring checks).
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    document = pdfium.PdfDocument(pdf_bytes)
+    try:
+        parts = []
+        for index in range(len(document)):
+            page = document[index]
+            try:
+                textpage = page.get_textpage()
+                try:
+                    parts.append(textpage.get_text_range())
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+        raw_text = "\n".join(parts)
+        return " ".join(raw_text.split())
+    finally:
+        document.close()
+
+
+def test_v1_analyze_output_format_pdf_returns_pdf_with_disclaimer_and_sample_id() -> None:
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"output_format": "pdf", "sample_id": "pdf-out-001"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.content.startswith(b"%PDF")
+
+    text = _extract_pdf_text(response.content)
+    assert DISCLAIMER_CORE_PHRASE in text
+    assert "pdf-out-001" in text
+
+
+def test_v1_analyze_output_format_pdf_content_disposition_with_sample_id() -> None:
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"output_format": "pdf", "sample_id": "with-id-007"},
+    )
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert "attachment" in disposition
+    assert ".pdf" in disposition
+    assert "with-id-007" in disposition
+
+
+def test_v1_analyze_output_format_pdf_content_disposition_without_sample_id() -> None:
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"output_format": "pdf"},
+    )
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert "attachment" in disposition
+    assert ".pdf" in disposition
+
+
+def test_v1_analyze_output_format_json_explicit_matches_default_shape() -> None:
+    image_bytes = _sample_png_bytes()
+
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", image_bytes, "image/png")},
+        data={"depth": "indepth", "sample_id": "json-explicit-001", "output_format": "json"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    body = response.json()
+
+    direct = run_analysis(image_bytes, depth="indepth", sample_id="json-explicit-001")
+    _assert_body_matches_direct_result(body, direct, sample_id="json-explicit-001")
+
+
+def test_v1_analyze_output_format_bogus_returns_structured_422() -> None:
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.png", _sample_png_bytes(), "image/png")},
+        data={"output_format": "bogus"},
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert isinstance(body["detail"], list)
+    assert body["detail"]
+
+
+def test_v1_analyze_pdf_input_with_pdf_output_format() -> None:
+    """PDF in, PDF out: Phase B's PDF-input handling and Phase D3's
+    PDF-output handling must compose correctly."""
+    response = client.post(
+        "/v1/analyze",
+        files={"image": ("sample.pdf", _clean_pdf_bytes(), "application/pdf")},
+        data={"output_format": "pdf", "sample_id": "pdf-in-pdf-out-001"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.content.startswith(b"%PDF")
+
+    text = _extract_pdf_text(response.content)
+    assert DISCLAIMER_CORE_PHRASE in text
+    assert "pdf-in-pdf-out-001" in text
