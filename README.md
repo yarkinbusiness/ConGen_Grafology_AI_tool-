@@ -71,12 +71,12 @@ usage: grafology-analyze [-h] [--depth {concise,indepth}] [--output PATH]
 
 Run the full handwriting-sample analysis pipeline (automated image-quality
 validation, classical feature analysis, interpretation, and markdown report
-generation) on a single image, end to end. This is a support tool for
-professional graphologists, not a diagnostic tool.
+generation) on a single handwriting sample (image or PDF), end to end. This is
+a support tool for professional graphologists, not a diagnostic tool.
 
 positional arguments:
-  image                 Path to the handwriting-sample image file (JPEG or
-                        PNG).
+  image                 Path to the handwriting-sample file (JPEG, PNG, or
+                        PDF). For a PDF, only the first page is analyzed.
 
 options:
   -h, --help            show this help message and exit
@@ -98,8 +98,10 @@ Example invocation, writing a concise report to a file instead of stdout:
 grafology-analyze path/to/sample.png --depth concise --sample-id S001 --output report.md
 ```
 
-A missing or unreadable image file produces a single clear `stderr`
-message and a non-zero exit code, never a raw Python traceback.
+A missing or unreadable image/PDF file produces a single clear `stderr`
+message and a non-zero exit code, never a raw Python traceback. A PDF with
+more than one page is accepted -- only the first page is analyzed, and the
+generated report notes this via an added `pdf_pages` validation flag.
 
 ## Using the API
 
@@ -130,12 +132,13 @@ print(data["report_markdown"])
 ```
 
 `POST /analyze` accepts `multipart/form-data` with an `image` file field
-plus optional `depth` (`"concise"`/`"indepth"`), `quality_label`
+(JPEG, PNG, or PDF -- for a PDF, only the first page is analyzed) plus
+optional `depth` (`"concise"`/`"indepth"`), `quality_label`
 (`"high"`/`"medium"`/`"low"`), and `sample_id` fields, and returns a JSON
 body with `sample_id`, `depth`, `report_markdown`, `overall_summary`,
 `has_rejected_validation`, and the full list of `validation_results`. An
-unreadable/corrupt upload returns `400 Bad Request` with a descriptive
-`detail` message rather than a raw traceback.
+unreadable/corrupt upload (image or PDF) returns `400 Bad Request` with a
+descriptive `detail` message rather than a raw traceback.
 
 A future real deployment would run this same `app` object under a
 standard ASGI server, e.g.:
